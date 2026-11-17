@@ -499,3 +499,151 @@ async def test_s1_cross_border_timeout_retry_and_app_permission_error() -> None:
         with pytest.raises(ForumParseError) as exc_info:
             await parser2.parse_thread(link2, embed_images=False)
         assert "本帖要求阅读权限高于 100" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_s1_specific_floor_findpost_parse_and_invisible_floor_unblock() -> None:
+    """验证带 pid 的指定楼层链接仅解析对应楼层（不解析主楼），且支持解锁被禁言的指定楼层并正确渲染楼层标签。"""
+    from core.renderer import build_template_payload
+    from core.url_extractor import parse_forum_url
+
+    floor_page_html = """
+    <html><body>
+      <div id="pt"><div class="z"><a href="forum-6-1.html">动漫论坛</a></div></div>
+      <div id="postlist">
+        <h1 class="ts"><span id="thread_subject">野生的最终BOSS出现了！ TV动画化</span></h1>
+        <div id="post_70514001">
+          <div class="pi"><strong><a id="postnum70514001"><em>201</em><sup>#</sup></a></strong>
+            <div class="authi"><a href="space-uid-111.html" class="xw1">路人层主</a></div>
+          </div>
+          <td id="postmessage_70514001">这是同一页上的其他楼层，绝不能误解析这一层！</td>
+        </div>
+        <div id="post_70514830">
+          <td class="pls"><p><em><a href="home.php?mod=spacecp&ac=usergroup&gid=54">婆罗门</a></em></p></td>
+          <div class="pi">
+            <strong><a id="postnum70514830"><em>239</em><sup>#</sup></a></strong>
+            <div class="pti"><div class="authi">
+              <a href="space-uid-36160.html" class="xw1">eilot</a>
+              <em id="authorposton70514830">发表于 2026-11-16 00:32</em>
+            </div></div>
+          </div>
+          <td id="postmessage_70514830">
+            <div class="quote"><blockquote>引用前一层讨论</blockquote></div>
+            这是 239 楼指定楼层的正文，<font color="LemonChiffon">反白剧透内容</font>
+          </td>
+        </div>
+      </div>
+    </body></html>
+    """
+
+    link = parse_forum_url(
+        "https://stage1st.com/2b/forum.php?mod=redirect&goto=findpost&ptid=2196337&pid=70514830"
+    )
+    assert link is not None
+
+    mocked = MockHttpRouter()
+    mocked.get(
+        "https://stage1st.com/2b/forum.php?mod=redirect&goto=findpost&ptid=2196337&pid=70514830",
+        status=200,
+        body=floor_page_html.encode("utf-8"),
+    )
+
+    async with aiohttp.ClientSession(middlewares=[mocked.middleware]) as session:
+        parser = Stage1stParser(session, config={"enabled": True})
+        res = await parser.parse_thread(link, embed_images=False)
+
+    assert res.tid == "2196337"
+    assert res.pid == "70514830"
+    assert res.is_main_post is False
+    assert res.floor_label == "239楼"
+    assert res.display_floor_badge == "239楼"
+    assert res.author == "eilot"
+    assert res.author_id == "36160"
+    assert res.author_group == "婆罗门"
+    assert "239 楼指定楼层的正文" in res.content_html
+    assert "绝不能误解析这一层" not in res.content_html
+    assert "forum-spoiler" in res.content_html
+
+    tmpl_data, _ = build_template_payload(res)
+    assert tmpl_data["floor_badge"] == "239楼"
+    assert tmpl_data["is_main_post"] is False
+    assert tmpl_data["pid"] == "70514830"
+
+    # 验证当指定楼层被禁言屏蔽时，App 接口精准解锁该 pid 楼层（不误返回 1L 主楼）
+    blocked_floor_html = """
+    <html><body>
+      <div id="postlist">
+        <h1 class="ts"><span id="thread_subject">测试禁言楼层解锁</span></h1>
+        <div id="post_70514830">
+          <div class="pi"><strong><a id="postnum70514830"><em>88</em><sup>#</sup></a></strong>
+            <div class="authi"><a href="space-uid-36160.html" class="xw1">被塞抹布层主</a></div>
+          </div>
+          <div class="plhin"><div class="pcb"><div class="locked">提示: <em>作者被禁止或删除 内容自动屏蔽</em></div></div></div>
+        </div>
+      </div>
+    </body></html>
+    """
+    link_banned_floor = parse_forum_url(
+        "https://stage1st.com/2b/thread-2196337-3-1.html#pid70514830"
+    )
+    assert link_banned_floor is not None
+
+    mocked_b = MockHttpRouter()
+    mocked_b.get(
+        "https://stage1st.com/2b/thread-2196337-3-1.html",
+        status=200,
+        body=blocked_floor_html.encode("utf-8"),
+    )
+    mocked_b.post(
+        "https://app.stage1st.com/2b/api/app/thread",
+        status=200,
+        payload={
+            "code": 200,
+            "data": {"tid": 2196337, "authorid": 999, "subject": "测试禁言楼层解锁"},
+        },
+    )
+    mocked_b.post(
+        "https://app.stage1st.com/2b/api/app/thread/page",
+        status=200,
+        payload={
+            "code": 200,
+            "data": {
+                "pageNo": 3,
+                "pageSize": 40,
+                "totalCount": 90,
+                "list": [
+                    {
+                        "pid": 70514800,
+                        "position": 81,
+                        "author": "其他人",
+                        "message": "81楼无关内容",
+                    },
+                    {
+                        "pid": 70514830,
+                        "position": 88,
+                        "author": "被塞抹布层主",
+                        "authorid": 36160,
+                        "dateline": 1763376300,
+                        "message": "成功解锁出的第 88 楼被禁言回复原文！",
+                    },
+                ],
+            },
+        },
+    )
+
+    async with aiohttp.ClientSession(middlewares=[mocked_b.middleware]) as session:
+        parser_b = Stage1stParser(
+            session,
+            config={
+                "enabled": True,
+                "app_sid": "preset_sid",
+                "enable_invisible_parse": True,
+            },
+        )
+        res_b = await parser_b.parse_thread(link_banned_floor, embed_images=False)
+
+    assert res_b.is_main_post is False
+    assert res_b.floor_label == "88楼"
+    assert res_b.is_unblocked_invisible is True
+    assert "第 88 楼被禁言回复原文" in res_b.content_html
+    assert "81楼无关内容" not in res_b.content_html

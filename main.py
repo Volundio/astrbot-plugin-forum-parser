@@ -336,7 +336,14 @@ class ForumParserPlugin(Star):
             if parsed_thread.category
             else parsed_thread.title
         )
-        meta_parts = [f"楼主：{parsed_thread.author}"]
+        if parsed_thread.is_main_post:
+            author_part = f"楼主：{parsed_thread.author}"
+            card_node_name = f"{parsed_thread.author} · 主楼长图"
+        else:
+            author_part = f"发言：{parsed_thread.author}（{parsed_thread.display_floor_badge}）"
+            card_node_name = f"{parsed_thread.author} · {parsed_thread.display_floor_badge}"
+
+        meta_parts = [author_part]
         if parsed_thread.forum_name:
             meta_parts.append(f"版块：{parsed_thread.forum_name}")
         if parsed_thread.created_at:
@@ -357,7 +364,7 @@ class ForumParserPlugin(Star):
             ),
             Comp.Node(
                 uin=bot_uin,
-                name=f"{parsed_thread.author} · 主楼长图",
+                name=card_node_name,
                 content=[card_img_comp],
             ),
         ]
@@ -434,7 +441,7 @@ class ForumParserPlugin(Star):
 
             cache_key = (
                 link.forum.value,
-                link.tid,
+                link.target_id,
                 embed_images,
                 max_inline_images,
                 enable_length_limit,
@@ -482,9 +489,15 @@ class ForumParserPlugin(Star):
                         event, parsed_thread, render_res, onebot_opts, temp_scope
                     )
                 elif platform_name == "telegram":
-                    # Telegram 平台统一仅推送自定义模板渲染的主楼完整长图，并固定走无损文件形式 (send as file / send_document)
+                    # Telegram 平台统一仅推送自定义模板渲染的长图，并固定走无损文件形式 (send as file / send_document)
                     ext = "png" if render_res.mime_type == "image/png" else "jpg"
-                    fname = f"{link.forum.value}_{link.tid}.{ext}"
+                    tid_part = parsed_thread.tid or link.tid
+                    floor_suffix = (
+                        f"_p{parsed_thread.pid}"
+                        if (not parsed_thread.is_main_post and parsed_thread.pid)
+                        else (f"_f{link.floor_hint}" if link.floor_hint > 0 else "")
+                    )
+                    fname = f"{link.forum.value}_{tid_part}{floor_suffix}.{ext}"
                     msg_result = event.chain_result(
                         [Comp.File(name=fname, file=render_res.image_path)]
                     )
@@ -589,8 +602,12 @@ class ForumParserPlugin(Star):
         )
 
         for link in links[:max_links]:
-            if not self._cooldown.check_and_mark(session_key, link.forum, link.tid, cooldown_sec):
-                logger.debug(f"跳过冷却期内的重复论坛链接: {link.forum.value} tid={link.tid}")
+            if not self._cooldown.check_and_mark(
+                session_key, link.forum, link.target_id, cooldown_sec
+            ):
+                logger.debug(
+                    f"跳过冷却期内的重复论坛链接: {link.forum.value} target={link.target_id}"
+                )
                 continue
 
             temp_scope = self._temp_mgr.create_scope()

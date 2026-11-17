@@ -45,8 +45,13 @@ URL_CANDIDATE_PATTERN = re.compile(
 TRAILING_PUNCTUATION = ".,;:!?)]}>'\"，。；：！？）、》】」』"
 
 # S1 静态伪静态路径匹配
-S1_THREAD_HTML_PATTERN = re.compile(r"/thread-(\d+)-\d+-\d+\.html", re.IGNORECASE)
+S1_THREAD_HTML_PATTERN = re.compile(r"/thread-(\d+)-(\d+)-\d+\.html", re.IGNORECASE)
 S1_ARCHIVER_PATTERN = re.compile(r"/archiver/tid-(\d+)\.html", re.IGNORECASE)
+S1_FRAGMENT_PID_PATTERN = re.compile(r"^(?:pid|post_)(\d+)$", re.IGNORECASE)
+
+# NGA 锚点匹配（如 #pid795123456Anchor 或 #l25）
+NGA_FRAGMENT_PID_PATTERN = re.compile(r"^pid(\d+)(?:anchor)?$", re.IGNORECASE)
+NGA_FRAGMENT_FLOOR_PATTERN = re.compile(r"^l(\d+)$", re.IGNORECASE)
 
 
 def _strip_trailing_punctuation(raw_url: str) -> str:
@@ -120,46 +125,132 @@ def parse_forum_url(
         if not path.startswith("/2b/"):
             return None
 
-        tid: str | None = None
+        qs = parse_qs(parsed.query)
+        frag = (parsed.fragment or "").strip()
+
+        tid = ""
+        pid = ""
+        page = 1
+
+        raw_page = qs.get("page", [None])[0]
+        if raw_page and str(raw_page).isdigit() and int(raw_page) > 0:
+            page = int(raw_page)
+
+        m_frag_pid = S1_FRAGMENT_PID_PATTERN.match(frag)
+        if m_frag_pid and int(m_frag_pid.group(1)) > 0:
+            pid = m_frag_pid.group(1)
+
         m_thread = S1_THREAD_HTML_PATTERN.search(path)
         if m_thread:
             tid = m_thread.group(1)
+            if int(m_thread.group(2)) > 0:
+                page = int(m_thread.group(2))
         else:
             m_arch = S1_ARCHIVER_PATTERN.search(path)
             if m_arch:
                 tid = m_arch.group(1)
             elif path.lower().endswith("/forum.php"):
-                qs = parse_qs(parsed.query)
                 mod = (qs.get("mod", [""])[0] or "").lower()
-                # viewthread?tid=xxx 或 redirect?goto=findpost&ptid=xxx
+                goto = (qs.get("goto", [""])[0] or "").lower()
                 raw_tid = qs.get("tid", [None])[0] or (
                     qs.get("ptid", [None])[0] if mod == "redirect" else None
                 )
-                if raw_tid and raw_tid.isdigit():
+                if raw_tid and raw_tid.isdigit() and int(raw_tid) > 0:
                     tid = raw_tid
 
-        if tid and tid.isdigit() and int(tid) > 0:
+                raw_pid = qs.get("pid", [None])[0]
+                if (
+                    raw_pid
+                    and raw_pid.isdigit()
+                    and int(raw_pid) > 0
+                    and (mod in {"redirect", "viewthread"} or goto == "findpost")
+                ):
+                    pid = raw_pid
+
+        has_valid_tid = bool(tid and tid.isdigit() and int(tid) > 0)
+        has_valid_pid = bool(pid and pid.isdigit() and int(pid) > 0)
+
+        if has_valid_pid:
+            canonical = (
+                f"https://stage1st.com/2b/forum.php?mod=redirect&goto=findpost&ptid={tid}&pid={pid}"
+                if has_valid_tid
+                else f"https://stage1st.com/2b/forum.php?mod=redirect&goto=findpost&pid={pid}"
+            )
+            return ForumLink(
+                forum=ForumType.STAGE1ST,
+                tid=tid if has_valid_tid else "",
+                original_url=cleaned,
+                canonical_url=canonical,
+                pid=pid,
+                page=page,
+            )
+
+        if has_valid_tid:
             return ForumLink(
                 forum=ForumType.STAGE1ST,
                 tid=tid,
                 original_url=cleaned,
                 canonical_url=f"https://stage1st.com/2b/thread-{tid}-1-1.html",
+                page=1,
             )
         return None
 
-    # 2. NGA 识别
+    # 2. NGA 识别（支持主楼链接与带 pid / #l楼层 的单楼层链接）
     nga_hosts = NGA_PRIMARY_HOSTS | NGA_ALIAS_HOSTS if allow_alias_domains else NGA_PRIMARY_HOSTS
     if enable_nga and host in nga_hosts:
         path = (parsed.path or "").lower()
         if path in {"/read.php", "/nuke.php"} or path.endswith("/read.php"):
             qs = parse_qs(parsed.query)
+            frag = (parsed.fragment or "").strip()
+
             raw_tid = qs.get("tid", [None])[0]
-            if raw_tid and raw_tid.isdigit() and int(raw_tid) > 0:
+            tid = raw_tid if (raw_tid and raw_tid.isdigit() and int(raw_tid) > 0) else ""
+
+            raw_pid = qs.get("pid", [None])[0]
+            pid = raw_pid if (raw_pid and raw_pid.isdigit() and int(raw_pid) > 0) else ""
+            if not pid:
+                m_npid = NGA_FRAGMENT_PID_PATTERN.match(frag)
+                if m_npid and int(m_npid.group(1)) > 0:
+                    pid = m_npid.group(1)
+
+            floor_hint = 0
+            if not pid:
+                m_nfloor = NGA_FRAGMENT_FLOOR_PATTERN.match(frag)
+                if m_nfloor and int(m_nfloor.group(1)) > 0:
+                    floor_hint = int(m_nfloor.group(1))
+
+            raw_page = qs.get("page", [None])[0]
+            page = int(raw_page) if (raw_page and raw_page.isdigit() and int(raw_page) > 0) else 1
+
+            if pid:
+                canonical = (
+                    f"https://bbs.nga.cn/read.php?tid={tid}&pid={pid}"
+                    if tid
+                    else f"https://bbs.nga.cn/read.php?pid={pid}"
+                )
                 return ForumLink(
                     forum=ForumType.NGA,
-                    tid=raw_tid,
+                    tid=tid,
                     original_url=cleaned,
-                    canonical_url=f"https://bbs.nga.cn/read.php?tid={raw_tid}",
+                    canonical_url=canonical,
+                    pid=pid,
+                    page=page,
+                )
+            if tid and floor_hint > 0:
+                return ForumLink(
+                    forum=ForumType.NGA,
+                    tid=tid,
+                    original_url=cleaned,
+                    canonical_url=f"https://bbs.nga.cn/read.php?tid={tid}&page={page}#l{floor_hint}",
+                    page=page,
+                    floor_hint=floor_hint,
+                )
+            if tid:
+                return ForumLink(
+                    forum=ForumType.NGA,
+                    tid=tid,
+                    original_url=cleaned,
+                    canonical_url=f"https://bbs.nga.cn/read.php?tid={tid}",
                 )
         return None
 
@@ -291,7 +382,7 @@ def extract_forum_links_from_event(
         if raw_msg is not None:
             candidate_urls.extend(_extract_telegram_entity_urls(raw_msg))
 
-    # 4. 归一化并按 (forum, tid) 去重保序
+    # 4. 归一化并按 (forum, target_id) 去重保序（同帖不同楼层互不覆盖）
     results: list[ForumLink] = []
     seen: set[tuple[ForumType, str]] = set()
     for raw_u in candidate_urls:
@@ -303,7 +394,7 @@ def extract_forum_links_from_event(
         )
         if link is None:
             continue
-        key = (link.forum, link.tid)
+        key = (link.forum, link.target_id)
         if key not in seen:
             seen.add(key)
             results.append(link)

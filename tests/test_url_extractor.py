@@ -28,12 +28,32 @@ def test_parse_stage1st_urls() -> None:
     assert l2 is not None
     assert l2.tid == "2209876"
 
-    # redirect findpost ptid=...
+    # redirect findpost ptid=...&pid=... 应精准识别出目标楼层 pid，不退回主楼
     l3 = parse_forum_url(
-        "https://stage1st.com/2b/forum.php?mod=redirect&goto=findpost&ptid=2209876&pid=654321"
+        "https://stage1st.com/2b/forum.php?mod=redirect&goto=findpost&ptid=2196337&pid=70514830"
     )
     assert l3 is not None
-    assert l3.tid == "2209876"
+    assert l3.tid == "2196337"
+    assert l3.pid == "70514830"
+    assert l3.is_floor_link is True
+    assert (
+        l3.canonical_url
+        == "https://stage1st.com/2b/forum.php?mod=redirect&goto=findpost&ptid=2196337&pid=70514830"
+    )
+
+    # 省略 ptid 的纯 pid findpost 跳转与 #pid 锚点格式
+    l3_nop = parse_forum_url(
+        "https://stage1st.com/2b/forum.php?mod=redirect&goto=findpost&pid=70514830"
+    )
+    assert l3_nop is not None
+    assert l3_nop.tid == ""
+    assert l3_nop.pid == "70514830"
+
+    l3_hash = parse_forum_url("https://stage1st.com/2b/thread-2196337-6-1.html#pid70514830")
+    assert l3_hash is not None
+    assert l3_hash.tid == "2196337"
+    assert l3_hash.pid == "70514830"
+    assert l3_hash.page == 6
 
     # 同源旧域名 saraba1st.com 开关控制
     l4_on = parse_forum_url(
@@ -70,6 +90,19 @@ def test_parse_nga_urls_and_punctuation() -> None:
         parse_forum_url("https://ngabbs.com/read.php?tid=41112222", allow_alias_domains=False)
         is None
     )
+
+    # NGA 带 pid 或 #l楼层 的单回复链接识别
+    l3_pid = parse_forum_url("https://bbs.nga.cn/read.php?pid=795123456")
+    assert l3_pid is not None
+    assert l3_pid.tid == ""
+    assert l3_pid.pid == "795123456"
+    assert l3_pid.is_floor_link is True
+
+    l3_floor = parse_forum_url("https://bbs.nga.cn/read.php?tid=42396123&page=2#l25")
+    assert l3_floor is not None
+    assert l3_floor.tid == "42396123"
+    assert l3_floor.floor_hint == 25
+    assert l3_floor.page == 2
 
 
 def test_onebot11_json_share_card_and_qq_redirect() -> None:
@@ -117,8 +150,12 @@ def test_telegram_text_link_entities_and_dedup() -> None:
             entities=[
                 FakeEntity(type="text_link", url="https://stage1st.com/2b/thread-2211000-1-1.html"),
                 FakeEntity(type="text_link", url="https://bbs.nga.cn/read.php?tid=39887766"),
-                # 重复同帖不同页码应自动去重
+                # 重复同帖主楼不同页码应自动去重，但带 pid 的指定楼层链接应独立保留
                 FakeEntity(type="text_link", url="https://stage1st.com/2b/thread-2211000-5-1.html"),
+                FakeEntity(
+                    type="text_link",
+                    url="https://stage1st.com/2b/forum.php?mod=redirect&goto=findpost&ptid=2211000&pid=70514830",
+                ),
             ],
         )
     )
@@ -128,9 +165,10 @@ def test_telegram_text_link_entities_and_dedup() -> None:
         raw_message=tg_update,
     )
     links = extract_forum_links_from_event(ev)
-    assert [(x.forum, x.tid) for x in links] == [
-        (ForumType.STAGE1ST, "2211000"),
-        (ForumType.NGA, "39887766"),
+    assert [(x.forum, x.tid, x.pid) for x in links] == [
+        (ForumType.STAGE1ST, "2211000", ""),
+        (ForumType.NGA, "39887766", ""),
+        (ForumType.STAGE1ST, "2211000", "70514830"),
     ]
 
 

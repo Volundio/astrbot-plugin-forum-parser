@@ -2,6 +2,14 @@
 
 All notable changes to `astrbot_plugin_forum_parser` will be documented in this file.
 
+## [v0.2.0] - 2026-11-17
+
+### Added
+- **指定楼层链接精准解析（不误退回主楼）**：
+  - **Stage1st**：支持识别并解析指向特定楼层的链接（包括 `forum.php?mod=redirect&goto=findpost&ptid=...&pid=...`、省略 `ptid` 的 `findpost&pid=...`、以及带 `#pid...` / `#post_...` 锚点的链接），精准提取目标楼层内容、楼层号（如 `239楼`）与本层评分，并且当目标楼层作者被禁言屏蔽或审核中时同样支持通过 S1 官方 App 接口精准解锁该楼层。
+  - **NGA**：同步支持识别并解析 NGA 单条回复/指定楼层链接（`read.php?pid=...`、`read.php?tid=...&pid=...`、`#pid...Anchor` 及 `#l<楼层>`）。
+  - 渲染卡片顶栏与发言人徽章、OneBot v11 合并转发节点名称、Telegram 文件名、同帖消息去重、冷却追踪与解析缓存均已适配同帖不同楼层独立区分。
+
 ## [v0.1.3] - 2026-11-17
 
 ### Added

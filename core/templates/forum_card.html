@@ -624,7 +624,7 @@
           {% if forum_name %}
           <span class="forum-board">{{ forum_name | e }}</span>
           {% endif %}
-          <span class="tid-pill">TID #{{ tid | e }}</span>
+          <span class="tid-pill">TID #{{ tid | e }}{% if pid and not is_main_post %} · PID #{{ pid | e }}{% endif %}</span>
         </div>
         <div class="topbar-right">
           {% if is_unblocked_invisible %}
@@ -660,7 +660,7 @@
             <div class="author-meta">
               <div class="author-name-row">
                 <span class="author-name">{{ author | e }}</span>
-                <span class="op-tag">楼主 · 1L</span>
+                <span class="op-tag">{{ floor_badge | e }}</span>
                 {% if author_group %}
                 <span class="group-tag">{{ author_group | e }}</span>
                 {% endif %}
@@ -686,7 +686,7 @@
       <!-- 评分列表（如 S1 加鹅记录） -->
       {% if rates %}
       <div class="rate-section">
-        <div class="rate-header">主楼评分{% if rate_summary %}（{{ rate_summary | e }}）{% endif %}</div>
+        <div class="rate-header">{{ "主楼评分" if is_main_post else "本层评分" }}{% if rate_summary %}（{{ rate_summary | e }}）{% endif %}</div>
         <div class="rate-list">
           {% for r in rates %}
           <div class="rate-row">
@@ -703,7 +703,7 @@
       {% if is_truncated or omitted_images_count > 0 %}
       <div class="notice-banner">
         {% if is_truncated %}
-        ⚠️ 主楼内容较长，已截断展示前 {{ truncated_at_chars }} 字
+        ⚠️ {{ "主楼" if is_main_post else "本层" }}内容较长，已截断展示前 {{ truncated_at_chars }} 字
         {% endif %}
         {% if is_truncated and omitted_images_count > 0 %} · {% endif %}
         {% if omitted_images_count > 0 %}

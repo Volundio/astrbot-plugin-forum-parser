@@ -158,3 +158,38 @@ async def test_nga_fallback_to_app_api() -> None:
     assert res.author == "匿名用户 (123456)"
     assert res.score == 66
     assert "app_api 兜底通道" in res.content_html
+
+
+@pytest.mark.asyncio
+async def test_nga_specific_pid_floor_parse() -> None:
+    """验证 NGA 带 pid 的单回复链接解析对应楼层而非主楼。"""
+    from core.url_extractor import parse_forum_url
+
+    link = parse_forum_url("https://bbs.nga.cn/read.php?pid=795123456")
+    assert link is not None
+
+    nga_pid_json = (
+        '{"data":{'
+        '"__F":{"name":"猴区"},'
+        '"__T":{"tid":42396123,"subject":"NGA单楼层解析测试","authorid":10001,"replies":30},'
+        '"__U":{"20002":{"username":"回帖水友"}},'
+        '"__R":{"0":{"pid":795123456,"lou":15,"authorid":20002,"postdate":1763376500,"score":9,"content":"这是第 15 楼的单独回复内容"}}'
+        "}}"
+    )
+    mocked = MockHttpRouter()
+    mocked.get(
+        "https://bbs.nga.cn/read.php?pid=795123456&__output=11",
+        status=200,
+        body=nga_pid_json.encode("utf-8"),
+    )
+
+    async with aiohttp.ClientSession(middlewares=[mocked.middleware]) as session:
+        parser = NgaParser(session, config={"enabled": True})
+        res = await parser.parse_thread(link, embed_images=False)
+
+    assert res.tid == "42396123"
+    assert res.pid == "795123456"
+    assert res.is_main_post is False
+    assert res.floor_label == "15楼"
+    assert res.author == "回帖水友"
+    assert "第 15 楼的单独回复内容" in res.content_html

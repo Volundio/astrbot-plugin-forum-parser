@@ -21,17 +21,34 @@ class ForumType(StrEnum):
 
 @dataclass(frozen=True)
 class ForumLink:
-    """从消息中识别出的论坛帖子链接信息。"""
+    """从消息中识别出的论坛帖子或指定楼层链接信息。"""
 
     forum: ForumType
     tid: str
     original_url: str
     canonical_url: str
+    pid: str = ""
+    page: int = 1
+    floor_hint: int = 0
+
+    @property
+    def is_floor_link(self) -> bool:
+        """是否为指向特定回复楼层的链接。"""
+        return bool(self.pid) or self.floor_hint > 0
+
+    @property
+    def target_id(self) -> str:
+        """用于去重、冷却与缓存的唯一目标标识（区分同帖主楼与不同回复楼层）。"""
+        if self.pid:
+            return f"{self.tid}:pid:{self.pid}" if self.tid else f"pid:{self.pid}"
+        if self.floor_hint > 0:
+            return f"{self.tid}:floor:{self.floor_hint}"
+        return self.tid
 
 
 @dataclass
 class RateItem:
-    """主楼评分条目（如 S1 鹅评）。"""
+    """楼层评分条目（如 S1 鹅评）。"""
 
     user: str
     score: str
@@ -40,7 +57,7 @@ class RateItem:
 
 @dataclass
 class ParsedThread:
-    """解析后的论坛帖子主楼结构化数据。"""
+    """解析后的论坛帖子（主楼或指定楼层）结构化数据。"""
 
     forum: ForumType
     tid: str
@@ -48,6 +65,10 @@ class ParsedThread:
     title: str
     author: str
     content_html: str
+    pid: str = ""
+    floor_label: str = ""
+    is_main_post: bool = True
+    is_thread_author: bool = False
     author_id: str = ""
     author_avatar: str = ""
     author_group: str = ""
@@ -66,6 +87,13 @@ class ParsedThread:
     rate_summary: str = ""
     rates: list[RateItem] = field(default_factory=list)
     post_image_urls: list[str] = field(default_factory=list)
+
+    @property
+    def display_floor_badge(self) -> str:
+        """返回卡片与转发节点中展示的楼层标签文案。"""
+        if self.floor_label:
+            return self.floor_label
+        return "楼主 · 1L" if self.is_main_post else "指定楼层"
 
 
 @dataclass

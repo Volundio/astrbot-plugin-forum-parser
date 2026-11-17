@@ -5,6 +5,7 @@ import logging
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import aiohttp
 
@@ -68,6 +69,8 @@ WEB_LOGIN_OR_PERM_HINTS = (
 )
 
 UID_IN_HREF_RE = re.compile(r"(?:space-uid-|uid=)(\d+)")
+TID_IN_HREF_RE = re.compile(r"(?:thread-(\d+)-\d+-\d+\.html|[?&]tid=(\d+))")
+PAGE_IN_THREAD_RE = re.compile(r"/thread-\d+-(\d+)-\d+\.html")
 CHINA_TZ = timezone(timedelta(hours=8))
 
 # 针对跨境（如香港/海外直连内地阿里云源站）优化的短握手/读取超时与重试次数，避免丢包死连接傻等 15 秒
@@ -93,6 +96,58 @@ def build_s1_avatar_url(uid: str | int | None) -> str:
     padded = f"{int(s):09d}"
     path = f"{padded[0:3]}/{padded[3:5]}/{padded[5:7]}/{padded[7:9]}"
     return f"https://avatar.stage1st.com/{path}_avatar_middle.jpg"
+
+
+def _extract_tid_page_from_url(url_str: str) -> tuple[str, int]:
+    """从 S1 网页重定向后的最终 URL 中提取 tid 与 page 页码。"""
+    if not url_str:
+        return "", 1
+    try:
+        parsed = urlparse(url_str)
+    except ValueError:
+        return "", 1
+    tid = ""
+    page = 1
+    qs = parse_qs(parsed.query)
+    raw_tid = qs.get("tid", [None])[0] or qs.get("ptid", [None])[0]
+    if raw_tid and str(raw_tid).isdigit() and int(raw_tid) > 0:
+        tid = str(raw_tid)
+    raw_page = qs.get("page", [None])[0]
+    if raw_page and str(raw_page).isdigit() and int(raw_page) > 0:
+        page = int(raw_page)
+
+    m_t = TID_IN_HREF_RE.search(parsed.path or "")
+    if not tid and m_t:
+        tid = m_t.group(1) or m_t.group(2) or ""
+    m_p = PAGE_IN_THREAD_RE.search(parsed.path or "")
+    if m_p and int(m_p.group(1)) > 0:
+        page = int(m_p.group(1))
+    return tid, page
+
+
+def _format_s1_floor_label(
+    raw_floor: str,
+    *,
+    is_thread_author: bool = False,
+    force_non_main: bool = False,
+) -> tuple[str, bool]:
+    """规范化 S1 楼层标签文案，返回 (floor_label, is_main_post)。"""
+    cleaned = re.sub(r"\s+", "", (raw_floor or "").strip())
+    if not cleaned:
+        return ("指定楼层" if force_non_main else "楼主 · 1L"), (not force_non_main)
+
+    if not force_non_main and cleaned in {"楼主", "1#", "1"}:
+        return "楼主 · 1L", True
+
+    num_str = cleaned.removesuffix("#").removesuffix("楼").removesuffix("L")
+    if num_str.isdigit():
+        num = int(num_str)
+        if num <= 1 and not force_non_main:
+            return "楼主 · 1L", True
+        label = f"{num}楼"
+        return (f"楼主 · {label}" if is_thread_author else label), False
+
+    return (f"楼主 · {cleaned}" if is_thread_author else cleaned), False
 
 
 def format_timestamp_cn(ts: int | float | str | None) -> str:
@@ -387,22 +442,33 @@ class Stage1stParser(BaseForumParser):
         return None, False, (f"App 接口请求失败（{last_err}）" if last_err else "App 接口无响应")
 
     async def _fetch_via_app_api(
-        self, tid: str
+        self,
+        tid: str,
+        *,
+        target_pid: str = "",
+        page_hint: int = 1,
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str]:
-        """通过 S1 官方 App 接口并发获取主题元信息 (/thread) 与主楼 (/thread/page, pageSize=2)。
+        """通过 S1 官方 App 接口并发获取主题元信息 (/thread) 与目标楼层 (/thread/page)。
 
-        仅拉取前 2 条楼层以大幅缩减跨境数据包体积，并在检测到 sid 失效（50x 状态码）时自动重登重试。
+        - 主楼模式 (target_pid 为空)：仅请求 pageNo=1, pageSize=2，大幅缩减跨境数据包体积；
+        - 指定楼层模式 (target_pid 非空)：优先请求 page_hint 页 (pageSize=40) 精准匹配 pid，绝不误退回主楼。
         """
-        logger.info(f"Stage1st 正在通过官方 App 接口获取帖子主楼 (tid={tid})...")
+        if not tid:
+            return None, None, "缺少主题 ID (tid)，无法调用 App 接口"
+
+        target_desc = f"tid={tid}, pid={target_pid}" if target_pid else f"tid={tid}"
+        logger.info(f"Stage1st 正在通过官方 App 接口获取帖子内容 ({target_desc})...")
         sid = await self._get_app_sid(force_relogin=False)
         last_err = ""
+        init_page = max(1, page_hint) if target_pid else 1
+        req_page_size = "40" if target_pid else "2"
 
         for attempt in range(2):
             (thread_info, invalid_1, err_1), (page_data, invalid_2, err_2) = await asyncio.gather(
                 self._post_app_endpoint("thread", {"tid": tid}, sid),
                 self._post_app_endpoint(
                     "thread/page",
-                    {"tid": tid, "pageNo": "1", "pageSize": "2"},
+                    {"tid": tid, "pageNo": str(init_page), "pageSize": req_page_size},
                     sid,
                 ),
             )
@@ -420,28 +486,88 @@ class Stage1stParser(BaseForumParser):
                 break
 
             post_list = (page_data or {}).get("list") if isinstance(page_data, dict) else None
-            main_post: dict[str, Any] | None = None
+            matched_post: dict[str, Any] | None = None
+
+            if target_pid:
+                if isinstance(post_list, list):
+                    for p in post_list:
+                        if isinstance(p, dict) and str(p.get("pid") or "") == target_pid:
+                            matched_post = p
+                            break
+
+                # 若网页端重定向前超时导致未拿到准确页码 (init_page==1)，在合理页数范围内继续检索该 pid
+                if matched_post is None and isinstance(page_data, dict):
+                    try:
+                        total_cnt = int(page_data.get("totalCount") or 0)
+                    except (TypeError, ValueError):
+                        total_cnt = 0
+                    total_pages = (total_cnt + 39) // 40
+                    scan_pages = [
+                        p_no for p_no in range(1, min(6, total_pages + 1)) if p_no != init_page
+                    ]
+                    for p_no in scan_pages:
+                        extra_page, _, extra_err = await self._post_app_endpoint(
+                            "thread/page",
+                            {"tid": tid, "pageNo": str(p_no), "pageSize": "40"},
+                            sid,
+                        )
+                        if extra_err and not last_err:
+                            last_err = extra_err
+                        extra_list = (
+                            extra_page.get("list") if isinstance(extra_page, dict) else None
+                        )
+                        if isinstance(extra_list, list):
+                            for p in extra_list:
+                                if isinstance(p, dict) and str(p.get("pid") or "") == target_pid:
+                                    matched_post = p
+                                    break
+                        if matched_post is not None:
+                            break
+
+                if matched_post is not None:
+                    return thread_info, matched_post, last_err
+                return (
+                    thread_info,
+                    None,
+                    last_err or f"App 接口未找到指定楼层 (pid={target_pid})",
+                )
+
             if isinstance(post_list, list) and post_list:
-                target_pid = (thread_info or {}).get("pid")
+                op_pid = (thread_info or {}).get("pid")
                 for p in post_list:
                     if not isinstance(p, dict):
                         continue
-                    if p.get("position") == 1 or (
-                        target_pid and str(p.get("pid")) == str(target_pid)
-                    ):
-                        main_post = p
+                    if p.get("position") == 1 or (op_pid and str(p.get("pid")) == str(op_pid)):
+                        matched_post = p
                         break
-                if main_post is None and isinstance(post_list[0], dict):
-                    main_post = post_list[0]
+                if matched_post is None and isinstance(post_list[0], dict):
+                    matched_post = post_list[0]
 
-            if thread_info or main_post:
-                return thread_info, main_post, last_err
+            if thread_info or matched_post:
+                return thread_info, matched_post, last_err
             break
 
-        return None, None, (last_err or "未获取到主楼内容")
+        return None, None, (last_err or "未获取到帖子内容")
 
-    async def _fetch_web_page(self, tid: str, cookies: dict[str, str]) -> tuple[str | None, str]:
-        url = f"{S1_WEB_BASE}thread-{tid}-1-1.html"
+    async def _fetch_web_page(
+        self,
+        tid: str,
+        cookies: dict[str, str],
+        *,
+        pid: str = "",
+        page: int = 1,
+    ) -> tuple[str | None, str, str, int]:
+        """拉取 S1 网页 HTML。支持主楼静态页与 findpost 指定楼层跳转，并返回解析出的 (html, err, resolved_tid, resolved_page)。"""
+        if pid:
+            if tid and page > 1:
+                url = f"{S1_WEB_BASE}thread-{tid}-{page}-1.html"
+            elif tid:
+                url = f"{S1_WEB_BASE}forum.php?mod=redirect&goto=findpost&ptid={tid}&pid={pid}"
+            else:
+                url = f"{S1_WEB_BASE}forum.php?mod=redirect&goto=findpost&pid={pid}"
+        else:
+            url = f"{S1_WEB_BASE}thread-{tid}-1-1.html"
+
         headers = {
             "User-Agent": DEFAULT_BROWSER_UA,
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -449,6 +575,9 @@ class Stage1stParser(BaseForumParser):
             "Referer": S1_WEB_BASE,
         }
         last_err = ""
+        resolved_tid = tid
+        resolved_page = max(1, page)
+
         for attempt in range(S1_MAX_ATTEMPTS):
             req_headers = dict(headers)
             if attempt > 0:
@@ -459,28 +588,41 @@ class Stage1stParser(BaseForumParser):
                     headers=req_headers,
                     cookies=cookies or None,
                     timeout=S1_REQUEST_TIMEOUT,
+                    allow_redirects=True,
                 ) as resp:
+                    r_tid, r_page = _extract_tid_page_from_url(str(resp.url or ""))
+                    if r_tid:
+                        resolved_tid = r_tid
+                    if r_page > 1 or not pid:
+                        resolved_page = r_page
+
                     if resp.status != 200:
                         last_err = f"HTTP {resp.status}"
                         if resp.status >= 500 and attempt + 1 < S1_MAX_ATTEMPTS:
                             continue
                         break
                     raw_bytes = await read_response_bounded(resp)
-                    return raw_bytes.decode("utf-8", errors="replace"), ""
+                    return (
+                        raw_bytes.decode("utf-8", errors="replace"),
+                        "",
+                        resolved_tid,
+                        resolved_page,
+                    )
             except Exception as e:
                 last_err = format_network_exc(e)
                 if attempt + 1 < S1_MAX_ATTEMPTS:
                     logger.debug(
-                        f"Stage1st 网页请求第 {attempt + 1} 次异常 (tid={tid})，换新连接重试: {last_err}"
+                        f"Stage1st 网页请求第 {attempt + 1} 次异常 (tid={tid}, pid={pid})，换新连接重试: {last_err}"
                     )
                     continue
-        logger.warning(f"Stage1st 网页请求失败 (tid={tid}): {last_err}")
-        return None, f"网页请求失败（{last_err or '未知错误'}）"
+        logger.warning(f"Stage1st 网页请求失败 (tid={tid}, pid={pid}): {last_err}")
+        return None, f"网页请求失败（{last_err or '未知错误'}）", resolved_tid, resolved_page
 
     @staticmethod
     def _extract_web_metadata(doc: MiniNode) -> dict[str, Any]:
-        """从 S1 网页 DOM 提取标题、分类、版块、浏览/回复数。"""
+        """从 S1 网页 DOM 提取标题、分类、版块、tid、浏览/回复数。"""
         meta: dict[str, Any] = {
+            "tid": "",
             "title": "",
             "category": "",
             "forum_name": "",
@@ -501,15 +643,19 @@ class Stage1stParser(BaseForumParser):
                         meta["category"] = cat_txt
                         break
 
-        # 面包屑导航提取版块名
+        # 面包屑导航提取版块名与兜底 tid
         pt_div = doc.find_first(id_exact="pt")
         if pt_div:
-            forum_links = [
-                a.inner_text().strip()
-                for a in pt_div.find_all(tag="a")
-                if ("forum-" in a.get_attr("href") or "mod=forumdisplay" in a.get_attr("href"))
-                and a.inner_text().strip()
-            ]
+            forum_links: list[str] = []
+            for a in pt_div.find_all(tag="a"):
+                href = a.get_attr("href")
+                txt = a.inner_text().strip()
+                if not meta["tid"]:
+                    m_tid = TID_IN_HREF_RE.search(href)
+                    if m_tid:
+                        meta["tid"] = m_tid.group(1) or m_tid.group(2) or ""
+                if ("forum-" in href or "mod=forumdisplay" in href) and txt:
+                    forum_links.append(txt)
             if forum_links:
                 meta["forum_name"] = forum_links[-1]
 
@@ -530,8 +676,10 @@ class Stage1stParser(BaseForumParser):
         return meta
 
     @staticmethod
-    def _extract_web_first_post(doc: MiniNode) -> tuple[MiniNode | None, str]:
-        """查找网页中的主楼节点，并检测是否存在审核/屏蔽/登录限制。
+    def _extract_web_target_post(
+        doc: MiniNode, *, target_pid: str = ""
+    ) -> tuple[MiniNode | None, str]:
+        """查找网页中的目标楼层节点（target_pid 为空时取主楼，非空时精准匹配 post_<pid>），并检测审核/屏蔽限制。
 
         Returns:
             (post_div_or_none, block_reason_if_any)
@@ -550,44 +698,56 @@ class Stage1stParser(BaseForumParser):
         if not postlist:
             return None, ""
 
-        post_divs = [
-            c
-            for c in postlist.children
-            if not c.is_text and c.tag == "div" and c.get_attr("id").startswith("post_")
-        ]
-        if not post_divs:
-            post_divs = postlist.find_all(tag="div", id_prefix="post_")
-        if not post_divs:
-            return None, ""
+        target_post: MiniNode | None = None
+        if target_pid:
+            target_post = postlist.find_first(tag="div", id_exact=f"post_{target_pid}")
+            if target_post is None:
+                return None, f"页面中未找到指定楼层 (pid={target_pid})"
+        else:
+            post_divs = [
+                c
+                for c in postlist.children
+                if not c.is_text and c.tag == "div" and c.get_attr("id").startswith("post_")
+            ]
+            if not post_divs:
+                post_divs = postlist.find_all(tag="div", id_prefix="post_")
+            if not post_divs:
+                return None, ""
 
-        first_post = post_divs[0]
-        for p in post_divs:
-            floor_el = p.find_first(tag="a", id_prefix="postnum")
-            if floor_el:
-                fl_txt = floor_el.inner_text().strip()
-                if "楼主" in fl_txt or fl_txt in {"1#", "1 #", "1"}:
-                    first_post = p
-                    break
+            target_post = post_divs[0]
+            for p in post_divs:
+                floor_el = p.find_first(tag="a", id_prefix="postnum")
+                if floor_el:
+                    fl_txt = floor_el.inner_text().strip()
+                    if "楼主" in fl_txt or fl_txt in {"1#", "1 #", "1"}:
+                        target_post = p
+                        break
 
-        plhin = first_post.find_first(class_name="plhin") or first_post
+        plhin = target_post.find_first(class_name="plhin") or target_post
         plhin_text = plhin.inner_text()
         for hint in WEB_BLOCKED_POST_HINTS:
             if hint in plhin_text:
-                return first_post, hint
+                return target_post, hint
 
-        msg_td = first_post.find_first(tag="td", id_prefix="postmessage_")
+        msg_td = target_post.find_first(tag="td", id_prefix="postmessage_")
         if msg_td is None:
-            pcb = first_post.find_first(class_name="pcb")
+            pcb = target_post.find_first(class_name="pcb")
             pcb_text = pcb.inner_text().strip() if pcb else ""
             if pcb_text:
-                return first_post, pcb_text[:60]
-            return first_post, "主楼内容不可见"
+                return target_post, pcb_text[:60]
+            return target_post, ("该楼层内容不可见" if target_pid else "主楼内容不可见")
 
-        return first_post, ""
+        return target_post, ""
 
     @staticmethod
     def _extract_post_details_from_div(post_div: MiniNode) -> dict[str, Any]:
-        """从正常可见的 S1 主楼 DOM 节点提取作者、时间、正文与评分。"""
+        """从正常可见的 S1 楼层 DOM 节点提取 pid、楼层号、作者、时间、正文与评分。"""
+        post_pid = post_div.get_attr("id").removeprefix("post_").strip()
+        raw_floor_txt = ""
+        floor_el = post_div.find_first(tag="a", id_prefix="postnum")
+        if floor_el:
+            raw_floor_txt = floor_el.inner_text().strip()
+
         author = "匿名"
         author_id = ""
         authi_links = post_div.find_all(tag="a", predicate=lambda n: "xw1" in n.classes)
@@ -599,6 +759,11 @@ class Stage1stParser(BaseForumParser):
                 if m_uid:
                     author_id = m_uid.group(1)
                 break
+
+        # 检测非首楼中是否带有 Discuz 楼主标识
+        pti_div = post_div.find_first(class_name="pti")
+        pti_text = pti_div.inner_text() if pti_div else ""
+        is_op_reply = "楼主" in pti_text and raw_floor_txt not in {"楼主", "1#", "1 #", "1"}
 
         avatar_url = ""
         avatar_div = post_div.find_first(class_name="avatar")
@@ -681,6 +846,9 @@ class Stage1stParser(BaseForumParser):
                             rates.append(RateItem(user=u_name, score=sc_txt, reason=rsn_txt))
 
         return {
+            "pid": post_pid,
+            "raw_floor": raw_floor_txt,
+            "is_op_reply": is_op_reply,
             "author": author,
             "author_id": author_id,
             "author_avatar": avatar_url,
@@ -701,17 +869,30 @@ class Stage1stParser(BaseForumParser):
         max_content_chars: int = 15000,
     ) -> ParsedThread:
         tid = link.tid
-        canonical_url = f"{S1_WEB_BASE}thread-{tid}-1-1.html"
+        target_pid = link.pid
 
         web_cookies = await self._get_web_cookies()
         if not web_cookies and self._has_credentials():
             web_cookies = await self._login_web_session()
 
-        html_text, web_err = await self._fetch_web_page(tid, web_cookies)
+        html_text, web_err, resolved_tid, resolved_page = await self._fetch_web_page(
+            tid,
+            web_cookies,
+            pid=target_pid,
+            page=link.page,
+        )
+        if resolved_tid:
+            tid = resolved_tid
+
         doc = parse_html(html_text) if html_text else None
         web_meta = self._extract_web_metadata(doc) if doc else {}
-        first_post_div, block_reason = (
-            self._extract_web_first_post(doc) if doc else (None, web_err or "网页请求失败")
+        if not tid and web_meta.get("tid"):
+            tid = str(web_meta["tid"])
+
+        target_post_div, block_reason = (
+            self._extract_web_target_post(doc, target_pid=target_pid)
+            if doc
+            else (None, web_err or "网页请求失败")
         )
 
         # 若因未登录受限且配置了账号密码但此前使用的是缓存旧 Cookie，尝试刷新一次网页登录
@@ -725,14 +906,34 @@ class Stage1stParser(BaseForumParser):
             fresh_cookies = await self._login_web_session()
             if fresh_cookies:
                 web_cookies = fresh_cookies
-                html_text, web_err = await self._fetch_web_page(tid, web_cookies)
+                html_text, web_err, resolved_tid, resolved_page = await self._fetch_web_page(
+                    tid,
+                    web_cookies,
+                    pid=target_pid,
+                    page=resolved_page,
+                )
+                if resolved_tid:
+                    tid = resolved_tid
                 if html_text:
                     doc = parse_html(html_text)
                     web_meta = self._extract_web_metadata(doc)
-                    first_post_div, block_reason = self._extract_web_first_post(doc)
+                    if not tid and web_meta.get("tid"):
+                        tid = str(web_meta["tid"])
+                    target_post_div, block_reason = self._extract_web_target_post(
+                        doc, target_pid=target_pid
+                    )
+
+        if target_pid:
+            canonical_url = (
+                f"{S1_WEB_BASE}forum.php?mod=redirect&goto=findpost&ptid={tid}&pid={target_pid}"
+                if tid
+                else f"{S1_WEB_BASE}forum.php?mod=redirect&goto=findpost&pid={target_pid}"
+            )
+        else:
+            canonical_url = f"{S1_WEB_BASE}thread-{tid}-1-1.html"
 
         is_web_network_failure = html_text is None
-        need_app_unblock = first_post_div is None or bool(block_reason)
+        need_app_unblock = target_post_div is None or bool(block_reason)
         is_unblocked_invisible = False
         invisible_reason = ""
 
@@ -741,6 +942,9 @@ class Stage1stParser(BaseForumParser):
         forum_name = web_meta.get("forum_name") or ""
         views = web_meta.get("views")
         replies = web_meta.get("replies")
+        parsed_pid = target_pid
+        raw_floor_txt = ""
+        is_op_reply = False
         author = ""
         author_id = ""
         author_avatar = ""
@@ -750,8 +954,11 @@ class Stage1stParser(BaseForumParser):
         rate_summary = ""
         rates: list[RateItem] = []
 
-        if first_post_div is not None and not block_reason:
-            details = self._extract_post_details_from_div(first_post_div)
+        if target_post_div is not None and not block_reason:
+            details = self._extract_post_details_from_div(target_post_div)
+            parsed_pid = details["pid"] or parsed_pid
+            raw_floor_txt = details["raw_floor"]
+            is_op_reply = bool(details["is_op_reply"])
             author = details["author"]
             author_id = details["author_id"]
             author_avatar = details["author_avatar"]
@@ -760,9 +967,12 @@ class Stage1stParser(BaseForumParser):
             raw_post_html = details["raw_html"]
             rate_summary = details["rate_summary"]
             rates = details["rates"]
-        elif first_post_div is not None and block_reason:
-            # 即使主楼正文被屏蔽（如作者被禁言），仍可先提取网页上的楼层外围信息作为补充
-            details = self._extract_post_details_from_div(first_post_div)
+        elif target_post_div is not None and block_reason:
+            # 即使楼层正文被屏蔽（如作者被禁言），仍可先提取网页上的楼层号与外围信息作为补充
+            details = self._extract_post_details_from_div(target_post_div)
+            parsed_pid = details["pid"] or parsed_pid
+            raw_floor_txt = details["raw_floor"]
+            is_op_reply = bool(details["is_op_reply"])
             author = details["author"]
             author_id = details["author_id"]
             author_avatar = details["author_avatar"]
@@ -771,16 +981,25 @@ class Stage1stParser(BaseForumParser):
             rate_summary = details["rate_summary"]
             rates = details["rates"]
 
-        # 当主楼不可见（审核中 / 禁言屏蔽 / 权限限制）或网页端请求超时时，调用 S1 官方 App API 解锁/兜底
+        # 当目标楼层不可见（审核中 / 禁言屏蔽 / 权限限制）或网页端请求超时时，调用 S1 官方 App API 解锁/兜底
         if need_app_unblock:
             if not self._enable_invisible_parse and not is_web_network_failure:
                 raise ForumParseError(
-                    f"Stage1st 帖子主楼当前不可见（{block_reason or '受限'}），且未开启不可见内容解析。"
+                    f"Stage1st 帖子内容当前不可见（{block_reason or '受限'}），且未开启不可见内容解析。"
                 )
 
-            app_thread, app_post, app_err = await self._fetch_via_app_api(tid)
+            app_thread, app_post, app_err = await self._fetch_via_app_api(
+                tid,
+                target_pid=target_pid,
+                page_hint=resolved_page,
+            )
             if app_post and app_post.get("message"):
                 raw_post_html = str(app_post.get("message") or "")
+                parsed_pid = str(app_post.get("pid") or parsed_pid)
+                app_pos = app_post.get("position")
+                if app_pos is not None and str(app_pos).isdigit():
+                    raw_floor_txt = f"{int(app_pos)}#"
+
                 # 若仅因网页网络超时走 App 兜底成功，不误标“不可见内容”徽章；仅在网页确有屏蔽/审核提示时标注
                 if not is_web_network_failure:
                     is_unblocked_invisible = True
@@ -805,6 +1024,10 @@ class Stage1stParser(BaseForumParser):
                             replies = int(app_thread["replies"])
                         except (TypeError, ValueError):
                             pass
+                    op_uid = str(app_thread.get("authorid") or "")
+                    post_uid = str(app_post.get("authorid") or "")
+                    if op_uid and post_uid and op_uid == post_uid and str(app_pos) != "1":
+                        is_op_reply = True
 
                 author = str(app_post.get("author") or author or "未知作者")
                 author_id = str(app_post.get("authorid") or author_id or "")
@@ -828,11 +1051,18 @@ class Stage1stParser(BaseForumParser):
                         reason_parts.append(app_err)
                     else:
                         reason_parts.append(f"App 接口返回：{app_err}")
-                combined_reason = "；".join(reason_parts) or "帖子不存在或已彻底删除"
-                raise ForumParseError(f"无法解析 Stage1st 帖子 (tid={tid})：{combined_reason}")
+                combined_reason = "；".join(reason_parts) or "帖子或指定楼层不存在"
+                id_desc = f"tid={tid}, pid={target_pid}" if target_pid else f"tid={tid}"
+                raise ForumParseError(f"无法解析 Stage1st 帖子 ({id_desc})：{combined_reason}")
+
+        floor_label, is_main_post = _format_s1_floor_label(
+            raw_floor_txt,
+            is_thread_author=is_op_reply,
+            force_non_main=bool(target_pid and not raw_floor_txt),
+        )
 
         if not title:
-            title = f"Stage1st 主题 #{tid}"
+            title = f"Stage1st 主题 #{tid}" if tid else f"Stage1st 回复 #{parsed_pid}"
 
         post_image_urls: list[str] = []
         clean_html, is_truncated, char_count, omitted_imgs = await process_post_html(
@@ -849,7 +1079,7 @@ class Stage1stParser(BaseForumParser):
             out_post_image_urls=post_image_urls,
         )
 
-        # 预下载楼主头像为 Data URI 防止远端渲染器无法加载防盗链头像
+        # 预下载发言人头像为 Data URI 防止远端渲染器无法加载防盗链头像
         author_avatar = rewrite_legacy_media_url(author_avatar)
         if embed_images and author_avatar.startswith("http"):
             av_data = await _fetch_image_as_data_uri(
@@ -864,7 +1094,11 @@ class Stage1stParser(BaseForumParser):
 
         return ParsedThread(
             forum=ForumType.STAGE1ST,
-            tid=tid,
+            tid=tid or parsed_pid,
+            pid=parsed_pid,
+            floor_label=floor_label,
+            is_main_post=is_main_post,
+            is_thread_author=is_op_reply,
             url=canonical_url,
             title=title,
             author=author or "未知作者",

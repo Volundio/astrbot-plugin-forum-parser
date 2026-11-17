@@ -145,8 +145,8 @@ class ForumParserPlugin(Star):
             self._temp_dir,
             legacy_dirs=[self._data_dir / "render_cache"],
             ttl_seconds=180.0,
-            max_dir_files=30,
-            max_dir_bytes=64 * 1024 * 1024,
+            max_dir_files=60,
+            max_dir_bytes=160 * 1024 * 1024,
         )
         # 严格受限的纯文本轻量缓存（单条上限 128KB、总上限 1MB，含 Base64 图片的重型对象绝不驻留内存）
         self._parse_cache: BoundedTTLCache[tuple[Any, ...], ParsedThread] = BoundedTTLCache(
@@ -424,8 +424,8 @@ class ForumParserPlugin(Star):
             render_opts = self._get_sub_cfg("render_options")
             embed_images = bool(render_opts.get("embed_images", True))
             max_inline_images = int(render_opts.get("max_inline_images", 15))
-            enable_length_limit = bool(render_opts.get("enable_length_limit", True))
-            max_content_chars = int(render_opts.get("max_content_chars", 6000))
+            enable_length_limit = bool(render_opts.get("enable_length_limit", False))
+            max_content_chars = int(render_opts.get("max_content_chars", 15000))
 
             cache_key = (
                 link.forum.value,
@@ -476,7 +476,8 @@ class ForumParserPlugin(Star):
                     msg_result = await self._build_onebot_forward_result(
                         event, parsed_thread, render_res, onebot_opts, temp_scope
                     )
-                elif platform_name == "telegram" and render_res.exceeds_telegram_photo_limit:
+                elif platform_name == "telegram":
+                    # Telegram 平台统一仅推送自定义模板渲染的主楼完整长图，并固定走无损文件形式 (send as file / send_document)
                     ext = "png" if render_res.mime_type == "image/png" else "jpg"
                     fname = f"{link.forum.value}_{link.tid}.{ext}"
                     msg_result = event.chain_result(

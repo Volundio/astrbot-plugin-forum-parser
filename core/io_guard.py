@@ -12,7 +12,7 @@ from .models import ForumParseError
 
 # 网络响应体积硬上限（防止异常大页面或恶意响应导致内存溢出）
 MAX_HTML_JSON_RESPONSE_BYTES = 5 * 1024 * 1024  # 5 MB
-MAX_RENDERED_IMAGE_BYTES = 20 * 1024 * 1024  # 20 MB
+MAX_RENDERED_IMAGE_BYTES = 35 * 1024 * 1024  # 35 MB（适配 10MB 内嵌图片与完整主楼长图截图）
 STREAM_CHUNK_SIZE = 65536  # 64 KB 流式块大小
 
 

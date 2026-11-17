@@ -145,13 +145,13 @@ def build_template_payload(
     jpeg_quality = int(opts.get("jpeg_quality") or 90)
     jpeg_quality = max(40, min(100, jpeg_quality))
 
-    enable_length_limit = bool(opts.get("enable_length_limit", True))
+    enable_length_limit = bool(opts.get("enable_length_limit", False))
     raw_max_height = int(opts.get("max_card_height_px") or 0)
     max_body_height_px = 0
     if enable_length_limit and raw_max_height > 0:
-        # 自动结合 scale_factor 控制物理像素高度，确保在 Telegram sendPhoto 10000px 限制之内
-        safe_css_total_cap = int((9600 - viewport_width * scale_factor) / scale_factor)
-        effective_total_cap = min(raw_max_height, max(1200, safe_css_total_cap))
+        # 仅受限于 Chromium Skia 纹理高度安全边界（约 30000 物理像素），不再迁就 10000px 普通图片限制
+        chromium_safe_css_cap = int(30000 / scale_factor)
+        effective_total_cap = min(raw_max_height, max(1200, chromium_safe_css_cap))
         max_body_height_px = max(800, effective_total_cap - 380)
 
     author_clean = (thread.author or "?").strip()

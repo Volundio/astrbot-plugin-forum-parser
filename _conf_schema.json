@@ -80,30 +80,30 @@
       "embed_images": {
         "type": "bool",
         "description": "渲染主楼内嵌图片",
-        "hint": "开启后将自动预下载主楼图片（携带论坛登录态与防盗链请求头）并内嵌到渲染卡片中。",
+        "hint": "开启后将自动预下载主楼图片（携带论坛登录态与防盗链请求头，单图上限 5MB、整帖合计上限 10MB）并内嵌到渲染卡片中。",
         "default": true
       },
       "max_inline_images": {
         "type": "int",
         "description": "主楼最多内嵌图片数量",
-        "hint": "超出数量的图片将转为文字占位提示，防止多图长帖导致渲染超时或体积过大。",
+        "hint": "超出数量的图片将转为文字占位提示，防止极端多图帖导致渲染超时。",
         "default": 15
       },
       "enable_length_limit": {
         "type": "bool",
         "description": "启用超长主楼截断保护",
-        "hint": "开启后对万字长帖或超高页面进行安全截断，避免超出 Telegram 图片尺寸上限（宽高之和 <= 10000px）。",
-        "default": true
+        "hint": "默认关闭以完整渲染整栋主楼长图（Telegram 平台始终以无损原图文件形式发送完整长图，不受 10000px 限制）；如需限制超长帖体积可手动开启。",
+        "default": false
       },
       "max_content_chars": {
         "type": "int",
         "description": "主楼最大正文字数（开启截断保护时生效，0 为不限字数）",
-        "default": 6000
+        "default": 15000
       },
       "max_card_height_px": {
         "type": "int",
         "description": "卡片最大 CSS 高度 px（开启截断保护时生效，0 为不限高度）",
-        "default": 6200
+        "default": 16000
       }
     }
   },
@@ -165,7 +165,7 @@
       "forward_include_images": {
         "type": "bool",
         "description": "合并转发中一并发送帖子内原图",
-        "hint": "当帖子主楼包含图片（含动图 GIF）时，在合并转发消息中附带发送原图节点，方便单独点开查看或保存。",
+        "hint": "当帖子主楼包含图片（含动图 GIF）时，在合并转发消息中附带发送原图节点（单图上限 10MB、单次合并转发本地图片总预算 50MB），方便单独点开查看或保存。",
         "default": true
       },
       "forward_max_images": {

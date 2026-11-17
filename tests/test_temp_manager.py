@@ -209,13 +209,32 @@ async def test_oom_guards_stream_limit_and_forward_budget_and_concurrency(tmp_pa
     """验证流式下载体积超限中止防 OOM、合并转发字节预算超额自动降级 URL、并发排队背压与磁盘配额淘汰。"""
     import asyncio
 
-    from core.html_sanitizer import prepare_post_images_for_forward
+    from core.html_sanitizer import (
+        MAX_CARD_INLINE_SINGLE_BYTES,
+        MAX_CARD_INLINE_TOTAL_BYTES,
+        MAX_FORWARD_SINGLE_IMAGE_BYTES,
+        MAX_FORWARD_TOTAL_FILE_BYTES,
+        _data_uri_raw_byte_len,
+        prepare_post_images_for_forward,
+    )
     from core.io_guard import (
         BoundedTaskLimiter,
         ConcurrencyLimitError,
         ResponseTooLargeError,
         stream_response_to_file,
     )
+
+    assert MAX_CARD_INLINE_SINGLE_BYTES == 5 * 1024 * 1024
+    assert MAX_CARD_INLINE_TOTAL_BYTES == 10 * 1024 * 1024
+    assert MAX_FORWARD_SINGLE_IMAGE_BYTES == 10 * 1024 * 1024
+    assert MAX_FORWARD_TOTAL_FILE_BYTES == 50 * 1024 * 1024
+
+    import base64
+
+    for raw_len in (1, 2, 3, 1024, 4097):
+        sample = b"x" * raw_len
+        uri = f"data:image/png;base64,{base64.b64encode(sample).decode('ascii')}"
+        assert _data_uri_raw_byte_len(uri) == raw_len
 
     # 1. 流式落盘遇到超大响应立即抛错中止，且不遗留 .tmp 或残缺文件
     mocked = MockHttpRouter()

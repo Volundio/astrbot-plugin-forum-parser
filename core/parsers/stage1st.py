@@ -630,8 +630,8 @@ class Stage1stParser(BaseForumParser):
         *,
         embed_images: bool = True,
         max_inline_images: int = 15,
-        enable_length_limit: bool = True,
-        max_content_chars: int = 6000,
+        enable_length_limit: bool = False,
+        max_content_chars: int = 15000,
     ) -> ParsedThread:
         tid = link.tid
         canonical_url = f"{S1_WEB_BASE}thread-{tid}-1-1.html"

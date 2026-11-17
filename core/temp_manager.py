@@ -98,7 +98,7 @@ class TempFileManager:
     保障策略：
     1. 支持按请求分配独立 TempScope 目录承载流式落盘文件，既防止大图常驻内存导致 OOM，又便于原子级整目录销毁；
     2. 追踪所有内部落盘文件与 AstrBot html_renderer 生成的 data/temp/io_temp_img_*，发送后立即删除；
-    3. 启动自检清扫崩溃残留，运行期定时巡检同时执行 TTL 超时回收、文件数上限与磁盘总字节配额（默认 64MB）淘汰，停用时全量清空。
+    3. 启动自检清扫崩溃残留，运行期定时巡检同时执行 TTL 超时回收、文件数上限与磁盘总字节配额（默认 160MB）淘汰，停用时全量清空。
     """
 
     def __init__(
@@ -107,8 +107,8 @@ class TempFileManager:
         *,
         legacy_dirs: list[Path] | None = None,
         ttl_seconds: float = 180.0,
-        max_dir_files: int = 30,
-        max_dir_bytes: int = 64 * 1024 * 1024,
+        max_dir_files: int = 60,
+        max_dir_bytes: int = 160 * 1024 * 1024,
     ) -> None:
         self.temp_dir = temp_dir
         self.legacy_dirs = legacy_dirs or []

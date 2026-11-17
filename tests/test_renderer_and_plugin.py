@@ -261,7 +261,7 @@ async def test_plugin_end_to_end_aiocqhttp_and_telegram_tall_image(tmp_path: Pat
     assert len(qq_direct_outputs) == 1
     assert qq_direct_outputs[0].kind == "image"
 
-    # Telegram 不走 QQ 合并转发，超高图自动降级为原图文件发送
+    # Telegram 平台始终仅推送自定义模板渲染的主楼完整长图，并固定以 File (send as file) 方式发送
     ev_tg = AstrMessageEvent(
         "分享个帖 https://bbs.nga.cn/read.php?tid=12345",
         platform_name="telegram",
@@ -269,7 +269,26 @@ async def test_plugin_end_to_end_aiocqhttp_and_telegram_tall_image(tmp_path: Pat
     tg_outputs = [r async for r in plugin.on_forum_link_message(ev_tg)]
     assert len(tg_outputs) == 1
     assert tg_outputs[0].kind == "chain"
+    assert len(tg_outputs[0].payload) == 1
     assert isinstance(tg_outputs[0].payload[0], Comp.File)
+    assert tg_outputs[0].payload[0].name == "nga_12345.png"
+
+    # 即使渲染图尺寸很小（未超 10000px 普通图片限制），Telegram 也依然固定走 Comp.File 且不附带额外节点
+    small_png = _make_png_bytes(780, 900)
+    mocked.post(
+        "http://mock-t2i.local:8999/text2img/generate",
+        status=200,
+        body=small_png,
+        headers={"Content-Type": "image/png"},
+    )
+    # 清空队列使新注册的 small_png 生效
+    mocked._queues[("POST", "http://mock-t2i.local:8999/text2img/generate")].popleft()
+    tg_small_outputs = [r async for r in plugin.on_forum_link_message(ev_tg)]
+    assert len(tg_small_outputs) == 1
+    assert tg_small_outputs[0].kind == "chain"
+    assert len(tg_small_outputs[0].payload) == 1
+    assert isinstance(tg_small_outputs[0].payload[0], Comp.File)
+    assert tg_small_outputs[0].payload[0].name == "nga_12345.png"
 
     await plugin.terminate()
 

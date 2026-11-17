@@ -16,13 +16,14 @@ import aiohttp
 from .io_guard import mime_to_ext, sniff_image_mime, stream_response_to_file
 from .temp_manager import TempScope
 
-# HTML 渲染卡片内联图片内存保护预算（单图上限 2MB，整帖 Base64 总上限 4MB；超出部分保留 URL 或交由磁盘流式转发）
-MAX_CARD_INLINE_SINGLE_BYTES = 2 * 1024 * 1024
-MAX_CARD_INLINE_TOTAL_B64_BYTES = 4 * 1024 * 1024
+# HTML 渲染卡片内联图片内存保护预算（单图上限 5MB，整帖原始图片合计上限 10MB；超出部分保留外链或交由磁盘流式转发）
+MAX_CARD_INLINE_SINGLE_BYTES = 5 * 1024 * 1024
+MAX_CARD_INLINE_TOTAL_BYTES = 10 * 1024 * 1024
+MAX_CARD_INLINE_TOTAL_B64_BYTES = MAX_CARD_INLINE_TOTAL_BYTES
 
-# OneBot11 合并转发原图流式落盘预算（单图上限 8MB，单次合并消息落盘总上限 15MB 以防 OneBot WebSocket 序列化 OOM）
-MAX_FORWARD_SINGLE_IMAGE_BYTES = 8 * 1024 * 1024
-MAX_FORWARD_TOTAL_FILE_BYTES = 15 * 1024 * 1024
+# OneBot11 合并转发原图流式落盘预算（单图上限 10MB，单次合并消息本地图片总预算 50MB）
+MAX_FORWARD_SINGLE_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_FORWARD_TOTAL_FILE_BYTES = 50 * 1024 * 1024
 
 INLINED_FORUM_IMG_RE = re.compile(
     r'<img\b[^>]*?\bsrc="(data:image/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=]+)"[^>]*?\bdata-idx="(\d+)"'
@@ -749,6 +750,19 @@ async def _fetch_image_as_data_uri(
         return None
 
 
+def _data_uri_raw_byte_len(data_uri: str) -> int:
+    """精确计算 Base64 Data URI 对应的原始图片二进制字节数（不含头部与 Base64 编码膨胀）。"""
+    sep = ";base64,"
+    pos = data_uri.find(sep)
+    if pos < 0:
+        return len(data_uri)
+    b64_len = len(data_uri) - (pos + len(sep))
+    if b64_len <= 0:
+        return 0
+    pad = 2 if data_uri.endswith("==") else (1 if data_uri.endswith("=") else 0)
+    return max(0, (b64_len * 3) // 4 - pad)
+
+
 async def process_post_html(
     raw_html: str,
     *,
@@ -759,8 +773,8 @@ async def process_post_html(
     same_site_hosts: set[str] | None = None,
     embed_images: bool = True,
     max_inline_images: int = 15,
-    enable_length_limit: bool = True,
-    max_content_chars: int = 6000,
+    enable_length_limit: bool = False,
+    max_content_chars: int = 15000,
     out_post_image_urls: list[str] | None = None,
 ) -> tuple[str, bool, int, int]:
     """执行完整的主楼 HTML 清洗、反白展开、长度保护与图片内嵌流水线。
@@ -850,14 +864,15 @@ async def process_post_html(
                     unique_urls.append(u)
 
             sem = asyncio.Semaphore(3)
-            total_b64_budget = MAX_CARD_INLINE_TOTAL_B64_BYTES
-            used_b64_bytes = 0
+            total_inline_budget = MAX_CARD_INLINE_TOTAL_BYTES
+            used_inline_bytes = 0
             url_to_data_uri: dict[str, str] = {}
 
-            # 按序分组拉取并在预算耗尽后立即跳过后续大图拉取，防止并发瞬间撑大内存
+            # 按序分组拉取并在预算耗尽后立即跳过后续大图拉取，按原始图片字节计量防 OOM
             async def _worker(u: str) -> tuple[str, str | None]:
                 async with sem:
-                    if used_b64_bytes >= total_b64_budget:
+                    remain = total_inline_budget - used_inline_bytes
+                    if remain <= 0:
                         return u, None
                     uri = await _fetch_image_as_data_uri(
                         session,
@@ -865,18 +880,24 @@ async def process_post_html(
                         referer=referer,
                         cookies=cookies,
                         same_site_hosts=same_site_hosts,
+                        max_bytes=min(MAX_CARD_INLINE_SINGLE_BYTES, remain),
                     )
                     return u, uri
 
             for batch_start in range(0, len(unique_urls), 4):
-                if used_b64_bytes >= total_b64_budget:
+                if used_inline_bytes >= total_inline_budget:
                     break
                 batch = unique_urls[batch_start : batch_start + 4]
                 fetched = await asyncio.gather(*(_worker(u) for u in batch))
                 for u, uri in fetched:
-                    if uri is not None and (used_b64_bytes + len(uri)) <= total_b64_budget:
-                        url_to_data_uri[u] = uri
-                        used_b64_bytes += len(uri)
+                    if uri is not None:
+                        raw_sz = _data_uri_raw_byte_len(uri)
+                        if (
+                            raw_sz <= MAX_CARD_INLINE_SINGLE_BYTES
+                            and (used_inline_bytes + raw_sz) <= total_inline_budget
+                        ):
+                            url_to_data_uri[u] = uri
+                            used_inline_bytes += raw_sz
 
             for n in targets:
                 u = n.get_attr("src")
@@ -999,7 +1020,7 @@ async def prepare_post_images_for_forward(
             idx = int(idx_s)
             if idx >= len(target_urls) or idx in idx_to_file:
                 continue
-            est_raw_len = (len(uri) * 3) // 4
+            est_raw_len = _data_uri_raw_byte_len(uri)
             if est_raw_len > max_single_bytes or (used_file_bytes + est_raw_len) > max_total_bytes:
                 continue
             mime_part = uri.split(";", 1)[0].removeprefix("data:")

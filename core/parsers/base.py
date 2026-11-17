@@ -67,8 +67,8 @@ class BaseForumParser(ABC):
         *,
         embed_images: bool = True,
         max_inline_images: int = 15,
-        enable_length_limit: bool = True,
-        max_content_chars: int = 6000,
+        enable_length_limit: bool = False,
+        max_content_chars: int = 15000,
     ) -> ParsedThread:
         """解析帖子主楼并返回统一的 ParsedThread 结构。"""
         raise NotImplementedError

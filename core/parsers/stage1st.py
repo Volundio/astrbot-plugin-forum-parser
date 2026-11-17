@@ -1,13 +1,13 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
 import aiohttp
+from astrbot.api import logger
 
 from ..html_sanitizer import (
     MiniNode,
@@ -26,8 +26,6 @@ from ..models import (
     RateItem,
 )
 from .base import DEFAULT_BROWSER_UA, BaseForumParser, parse_cookie_string
-
-logger = logging.getLogger("astrbot")
 
 S1_WEB_BASE = "https://stage1st.com/2b/"
 S1_MOBILE_LOGIN_URL = (

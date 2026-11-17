@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import html
 import json
-import logging
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -25,8 +24,6 @@ from ..models import (
     ParsedThread,
 )
 from .base import DEFAULT_BROWSER_UA, BaseForumParser, parse_cookie_string
-
-logger = logging.getLogger("astrbot")
 
 NGA_WEB_BASE = "https://bbs.nga.cn/"
 # NGA 官方已下线旧域名 img.nga.178.com，切换为新图床域名 img.nga.cn

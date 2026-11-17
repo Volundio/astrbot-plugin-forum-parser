@@ -2,7 +2,7 @@ name: astrbot_plugin_forum_parser
 display_name: 论坛帖子解析 (Stage1st / NGA)
 short_desc: 自动解析 Stage1st 与 NGA 帖子主楼或指定楼层，支持 Telegraph 即时预览与自定义模板长图发送
 desc: 自动识别聊天中的 Stage1st (S1) 与 NGA 论坛帖子或指定楼层链接（支持同源域名、QQ JSON/小程序分享卡片、Telegram 超链接实体），支持配置登录态及 S1 官方 App 接口解锁审核中/禁言不可见内容，支持发布至 telegra.ph（配图自动转存 p.sda1.dev）或使用远程 HTML 渲染服务生成自定义主题长图发送。
-version: v0.3.0
+version: v0.3.1
 author: Volundio
 repo: https://github.com/Volundio/astrbot-plugin-forum-parser
 support_platforms:

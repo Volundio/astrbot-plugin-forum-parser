@@ -2,6 +2,11 @@
 
 All notable changes to `astrbot_plugin_forum_parser` will be documented in this file.
 
+## [v0.3.1] - 2026-11-18
+
+### Fixed
+- **日志规范合规修复**：将 `core/` 下所有运行时子模块（`renderer.py`、`temp_manager.py`、`telegraph_publisher.py`、`parsers/stage1st.py`、`parsers/nga.py`）统一改为 `from astrbot.api import logger`，彻底移除内置 `logging` 导入，严格符合 AstrBot 插件市场审核规范并统一插件级日志路由。
+
 ## [v0.3.0] - 2026-11-18
 
 ### Added

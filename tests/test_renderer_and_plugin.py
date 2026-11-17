@@ -458,3 +458,22 @@ async def test_onebot_forward_fetches_post_images_even_when_embed_disabled_and_s
     assert not (tmp_path / "s1_fwd_temp").exists()
 
     await plugin.terminate()
+
+
+def test_astrbot_market_compliance_no_stdlib_logging_in_runtime_modules() -> None:
+    """确保所有运行时代码严格遵守 AstrBot 插件规范：不使用内置 logging 或 print，logger 仅从 astrbot.api 导入。"""
+    import ast
+
+    repo_root = Path(__file__).resolve().parent.parent
+    runtime_files = [repo_root / "main.py", *sorted((repo_root / "core").rglob("*.py"))]
+
+    for py_file in runtime_files:
+        tree = ast.parse(py_file.read_text(encoding="utf-8"), filename=str(py_file))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    assert alias.name != "logging", f"{py_file.name} 违规导入了内置 logging 模块"
+            elif isinstance(node, ast.ImportFrom):
+                assert node.module != "logging", f"{py_file.name} 违规从内置 logging 导入"
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                assert node.func.id != "print", f"{py_file.name} 违规使用了 print()"

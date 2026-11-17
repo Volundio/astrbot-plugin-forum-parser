@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import shutil
 import tempfile
 import time
@@ -11,7 +10,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Generic, TypeVar
 
-logger = logging.getLogger("astrbot")
+from astrbot.api import logger
 
 K = TypeVar("K")
 V = TypeVar("V")

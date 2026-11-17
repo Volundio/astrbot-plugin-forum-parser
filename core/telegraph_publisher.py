@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import re
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -10,6 +9,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 import aiohttp
+from astrbot.api import logger
 
 from .html_sanitizer import (
     INLINED_FORUM_IMG_RE,
@@ -26,8 +26,6 @@ from .io_guard import mime_to_ext
 from .models import ForumParseError, ParsedThread
 from .parsers.base import DEFAULT_BROWSER_UA
 from .temp_manager import TempScope
-
-logger = logging.getLogger("astrbot")
 
 TELEGRAPH_API_BASE = "https://api.telegra.ph"
 DEFAULT_SDA1_UPLOAD_URL = "https://p.sda1.dev/api/v1/upload_external_noform"

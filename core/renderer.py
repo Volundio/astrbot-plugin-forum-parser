@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import logging
 import os
 import struct
 import tempfile
@@ -15,8 +14,6 @@ import aiohttp
 from .io_guard import MAX_RENDERED_IMAGE_BYTES, read_response_bounded, stream_response_to_file
 from .models import ForumType, ParsedThread, RenderResult
 from .temp_manager import TempFileManager, TempScope
-
-logger = logging.getLogger("astrbot")
 
 TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "forum_card.html"
 DEFAULT_ASTRBOT_T2I_ENDPOINT = "https://t2i.soulter.top/text2img"

@@ -1,0 +1,724 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width={{ viewport_width }}, initial-scale=1.0" />
+  <meta id="astrbot-t2i-shiki-runtime" name="generator" content="astrbot-plugin-forum-parser" />
+  <style>
+    /* 主题配色变量 */
+    :root {
+      --bg-outer: #f1f5f9;
+      --bg-card: #ffffff;
+      --bg-subtle: #f8fafc;
+      --bg-quote: #f1f5f9;
+      --bg-collapse: #f8fafc;
+      --bg-spoiler: #fef3c7;
+      --border-color: #e2e8f0;
+      --border-strong: #cbd5e1;
+      --text-primary: #1e293b;
+      --text-secondary: #64748b;
+      --text-muted: #94a3b8;
+      --accent: #2563eb;
+      --accent-soft: #dbeafe;
+      --accent-text: #1d4ed8;
+      --badge-bg: #1e293b;
+      --badge-fg: #ffffff;
+      --spoiler-fg: #78350f;
+      --spoiler-border: #f59e0b;
+      --shadow-card: 0 10px 30px rgba(15, 23, 42, 0.08);
+    }
+
+    /* Stage1st 经典暖鹅黄配色 */
+    body[data-theme="s1"] {
+      --bg-outer: #e7e9d6;
+      --bg-card: #f6f7eb;
+      --bg-subtle: #edefe0;
+      --bg-quote: #ebede0;
+      --bg-collapse: #eef0e2;
+      --bg-spoiler: #e5e8cf;
+      --border-color: #d5d7c0;
+      --border-strong: #b8bba0;
+      --text-primary: #22241d;
+      --text-secondary: #5c5f4e;
+      --text-muted: #828572;
+      --accent: #2b547e;
+      --accent-soft: #dfe7ef;
+      --accent-text: #1f4469;
+      --badge-bg: #515636;
+      --badge-fg: #f8f9f0;
+      --spoiler-fg: #363926;
+      --spoiler-border: #969a74;
+      --shadow-card: 0 8px 24px rgba(54, 57, 38, 0.10);
+    }
+
+    /* NGA 经典泥潭浅黄配色 */
+    body[data-theme="nga"] {
+      --bg-outer: #efe0c2;
+      --bg-card: #fff9eb;
+      --bg-subtle: #f7ecd2;
+      --bg-quote: #f5e7c8;
+      --bg-collapse: #f8eed6;
+      --bg-spoiler: #f2dfb8;
+      --border-color: #e3cca1;
+      --border-strong: #cca96e;
+      --text-primary: #2c1d11;
+      --text-secondary: #6e5239;
+      --text-muted: #96775a;
+      --accent: #9a3412;
+      --accent-soft: #f5dec4;
+      --accent-text: #7c2d12;
+      --badge-bg: #591804;
+      --badge-fg: #fff7ed;
+      --spoiler-fg: #591804;
+      --spoiler-border: #c28540;
+      --shadow-card: 0 8px 24px rgba(89, 24, 4, 0.10);
+    }
+
+    /* 现代深色主题 */
+    body[data-theme="dark"] {
+      --bg-outer: #0b1120;
+      --bg-card: #151f32;
+      --bg-subtle: #1e293b;
+      --bg-quote: #1c283c;
+      --bg-collapse: #1a2639;
+      --bg-spoiler: #292524;
+      --border-color: #2d3c53;
+      --border-strong: #475569;
+      --text-primary: #e2e8f0;
+      --text-secondary: #94a3b8;
+      --text-muted: #64748b;
+      --accent: #60a5fa;
+      --accent-soft: #1e3a5f;
+      --accent-text: #93c5fd;
+      --badge-bg: #3b82f6;
+      --badge-fg: #ffffff;
+      --spoiler-fg: #fcd34d;
+      --spoiler-border: #d97706;
+      --shadow-card: 0 10px 30px rgba(0, 0, 0, 0.35);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: {{ viewport_width }}px;
+      background-color: var(--bg-outer);
+      color: var(--text-primary);
+      font-family: "PingFang SC", "Hiragino Sans GB", "Noto Sans CJK SC", "Source Han Sans SC", "Microsoft YaHei", "WenQuanYi Micro Hei", -apple-system, BlinkMacSystemFont, sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .outer-wrap {
+      padding: 22px;
+      width: 100%;
+    }
+
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 16px;
+      box-shadow: var(--shadow-card);
+      overflow: hidden;
+    }
+
+    /* 顶部论坛与版块栏 */
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 10px;
+      padding: 14px 26px;
+      background: var(--bg-subtle);
+      border-bottom: 1px solid var(--border-color);
+    }
+
+    .topbar-left {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .forum-brand {
+      display: inline-flex;
+      align-items: center;
+      padding: 4px 11px;
+      border-radius: 7px;
+      background: var(--badge-bg);
+      color: var(--badge-fg);
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.4px;
+    }
+
+    .forum-board {
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text-secondary);
+    }
+
+    .tid-pill {
+      font-size: 12px;
+      color: var(--text-muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    .topbar-right {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .stat-pill {
+      font-size: 12.5px;
+      color: var(--text-secondary);
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      padding: 3px 9px;
+      border-radius: 999px;
+    }
+
+    .unblocked-badge {
+      font-size: 12.5px;
+      font-weight: 600;
+      color: #b45309;
+      background: #fef3c7;
+      border: 1px solid #f59e0b;
+      padding: 3px 10px;
+      border-radius: 999px;
+    }
+
+    body[data-theme="dark"] .unblocked-badge {
+      color: #fcd34d;
+      background: #451a03;
+      border-color: #b45309;
+    }
+
+    /* 标题与楼主栏 */
+    .header-section {
+      padding: 22px 26px 18px;
+      border-bottom: 1px dashed var(--border-color);
+    }
+
+    .post-title {
+      margin: 0 0 16px;
+      font-size: 23px;
+      font-weight: 700;
+      line-height: 1.42;
+      color: var(--text-primary);
+      word-break: break-word;
+    }
+
+    .category-chip {
+      display: inline-block;
+      vertical-align: 2px;
+      margin-right: 8px;
+      padding: 2px 9px;
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--accent-text);
+      background: var(--accent-soft);
+      border-radius: 6px;
+    }
+
+    .author-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .author-info {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-width: 0;
+    }
+
+    .avatar-img {
+      width: 42px;
+      height: 42px;
+      border-radius: 50%;
+      object-fit: cover;
+      border: 1.5px solid var(--border-strong);
+      flex-shrink: 0;
+    }
+
+    .avatar-fallback {
+      width: 42px;
+      height: 42px;
+      border-radius: 50%;
+      background: var(--badge-bg);
+      color: var(--badge-fg);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 18px;
+      font-weight: 700;
+      flex-shrink: 0;
+    }
+
+    .author-meta {
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+    }
+
+    .author-name-row {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      flex-wrap: wrap;
+    }
+
+    .author-name {
+      font-size: 15.5px;
+      font-weight: 700;
+      color: var(--text-primary);
+    }
+
+    .op-tag {
+      font-size: 11.5px;
+      font-weight: 700;
+      padding: 1px 7px;
+      border-radius: 5px;
+      background: var(--accent-soft);
+      color: var(--accent-text);
+    }
+
+    .group-tag {
+      font-size: 11.5px;
+      color: var(--text-secondary);
+      background: var(--bg-subtle);
+      border: 1px solid var(--border-color);
+      padding: 1px 7px;
+      border-radius: 5px;
+    }
+
+    .author-sub {
+      font-size: 12.5px;
+      color: var(--text-muted);
+    }
+
+    .post-time {
+      font-size: 13px;
+      color: var(--text-secondary);
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+
+    /* 主楼正文区 */
+    .content-clip-wrapper {
+      position: relative;
+      {% if max_body_height_px > 0 %}
+      max-height: {{ max_body_height_px }}px;
+      overflow: hidden;
+      {% endif %}
+    }
+
+    .post-body {
+      padding: 22px 26px 24px;
+      font-size: 16.5px;
+      line-height: 1.78;
+      color: var(--text-primary);
+      word-wrap: break-word;
+      overflow-wrap: anywhere;
+    }
+
+    .post-body p {
+      margin: 0 0 12px;
+    }
+
+    .post-body p:last-child {
+      margin-bottom: 0;
+    }
+
+    .post-body hr {
+      border: none;
+      border-top: 1px solid var(--border-color);
+      margin: 16px 0;
+    }
+
+    .forum-edit-note {
+      font-size: 13px;
+      font-style: italic;
+      color: var(--text-muted);
+      background: var(--bg-subtle);
+      border-left: 3px solid var(--border-strong);
+      padding: 6px 12px;
+      margin-bottom: 14px;
+      border-radius: 0 6px 6px 0;
+    }
+
+    .forum-heading {
+      margin: 18px 0 10px;
+      padding-bottom: 6px;
+      font-size: 18.5px;
+      font-weight: 700;
+      color: var(--accent-text);
+      border-bottom: 2px solid var(--border-color);
+    }
+
+    .post-body blockquote,
+    .forum-quote {
+      margin: 12px 0;
+      padding: 12px 16px;
+      background: var(--bg-quote);
+      border-left: 4px solid var(--border-strong);
+      border-radius: 0 8px 8px 0;
+      color: var(--text-secondary);
+      font-size: 15px;
+      line-height: 1.68;
+    }
+
+    .forum-collapse {
+      margin: 14px 0;
+      border: 1px solid var(--border-strong);
+      border-radius: 10px;
+      background: var(--bg-collapse);
+      overflow: hidden;
+    }
+
+    .forum-collapse-header,
+    .forum-collapse > summary {
+      padding: 8px 14px;
+      font-size: 13.5px;
+      font-weight: 700;
+      color: var(--accent-text);
+      background: var(--bg-subtle);
+      border-bottom: 1px solid var(--border-color);
+      list-style: none;
+    }
+
+    .forum-collapse-body {
+      padding: 12px 15px;
+    }
+
+    .forum-spoiler {
+      display: inline;
+      background: var(--bg-spoiler);
+      color: var(--spoiler-fg);
+      border-bottom: 1.5px dashed var(--spoiler-border);
+      padding: 1px 5px;
+      border-radius: 4px;
+    }
+
+    .forum-spoiler::before {
+      content: "反白 ";
+      font-size: 11px;
+      font-weight: 700;
+      opacity: 0.72;
+    }
+
+    .forum-del,
+    .post-body del,
+    .post-body s,
+    .post-body strike {
+      text-decoration: line-through;
+      color: var(--text-secondary);
+      opacity: 0.88;
+    }
+
+    .forum-link,
+    .post-body a {
+      color: var(--accent);
+      text-decoration: underline;
+      text-underline-offset: 3px;
+    }
+
+    .forum-mention {
+      display: inline-block;
+      padding: 0 6px;
+      border-radius: 5px;
+      background: var(--accent-soft);
+      color: var(--accent-text);
+      font-size: 14.5px;
+      font-weight: 600;
+    }
+
+    .forum-emote {
+      display: inline-block;
+      padding: 0 6px;
+      margin: 0 2px;
+      border-radius: 5px;
+      background: var(--bg-subtle);
+      border: 1px solid var(--border-color);
+      color: var(--text-secondary);
+      font-size: 13.5px;
+    }
+
+    .forum-smiley {
+      display: inline-block;
+      vertical-align: text-bottom;
+      max-height: 36px;
+      max-width: 64px;
+      margin: 0 2px;
+    }
+
+    .forum-img {
+      display: block;
+      max-width: 100%;
+      height: auto;
+      max-height: 1100px;
+      object-fit: contain;
+      margin: 14px auto;
+      border-radius: 10px;
+      border: 1px solid var(--border-color);
+      background: var(--bg-subtle);
+    }
+
+    .forum-attachments {
+      margin-top: 16px;
+      padding-top: 12px;
+      border-top: 1px dashed var(--border-color);
+    }
+
+    .forum-img-placeholder {
+      margin: 10px 0;
+      padding: 10px 14px;
+      border-radius: 8px;
+      background: var(--bg-subtle);
+      border: 1px dashed var(--border-strong);
+      color: var(--text-secondary);
+      font-size: 13.5px;
+      text-align: center;
+    }
+
+    .forum-code,
+    .post-body pre {
+      margin: 12px 0;
+      padding: 12px 14px;
+      background: var(--bg-subtle);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 13.5px;
+      line-height: 1.55;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+
+    .forum-list,
+    .post-body ul,
+    .post-body ol {
+      margin: 8px 0 12px;
+      padding-left: 24px;
+    }
+
+    .forum-table,
+    .post-body table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 12px 0;
+      font-size: 14.5px;
+    }
+
+    .forum-table td,
+    .forum-table th,
+    .post-body table td,
+    .post-body table th {
+      border: 1px solid var(--border-strong);
+      padding: 7px 10px;
+      vertical-align: top;
+    }
+
+    /* S1 评分栏 */
+    .rate-section {
+      margin: 0 26px 18px;
+      border: 1px solid var(--border-color);
+      border-radius: 10px;
+      background: var(--bg-subtle);
+      overflow: hidden;
+      font-size: 13px;
+    }
+
+    .rate-header {
+      padding: 7px 14px;
+      font-weight: 700;
+      color: var(--accent-text);
+      border-bottom: 1px solid var(--border-color);
+    }
+
+    .rate-list {
+      padding: 6px 14px;
+    }
+
+    .rate-row {
+      display: flex;
+      gap: 10px;
+      padding: 4px 0;
+      border-bottom: 1px dashed var(--border-color);
+      color: var(--text-secondary);
+    }
+
+    .rate-row:last-child {
+      border-bottom: none;
+    }
+
+    .rate-user {
+      font-weight: 600;
+      color: var(--text-primary);
+      min-width: 90px;
+    }
+
+    .rate-score {
+      font-weight: 700;
+      color: var(--accent);
+      min-width: 60px;
+    }
+
+    .rate-reason {
+      flex: 1;
+    }
+
+    /* 截断与省略提示横幅 */
+    .notice-banner {
+      margin: 0 26px 18px;
+      padding: 10px 14px;
+      border-radius: 8px;
+      background: var(--accent-soft);
+      color: var(--accent-text);
+      font-size: 13px;
+      font-weight: 600;
+      text-align: center;
+    }
+
+    /* 底部信息栏 */
+    .footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 26px;
+      background: var(--bg-subtle);
+      border-top: 1px solid var(--border-color);
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    .footer-url {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    }
+
+    .footer-brand {
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+  </style>
+</head>
+<body data-theme="{{ theme_key | e }}">
+  <div class="outer-wrap">
+    <div class="card">
+      <!-- 顶部栏 -->
+      <div class="topbar">
+        <div class="topbar-left">
+          <span class="forum-brand">{{ forum_badge | e }}</span>
+          {% if forum_name %}
+          <span class="forum-board">{{ forum_name | e }}</span>
+          {% endif %}
+          <span class="tid-pill">TID #{{ tid | e }}</span>
+        </div>
+        <div class="topbar-right">
+          {% if is_unblocked_invisible %}
+          <span class="unblocked-badge">🔓 已解锁不可见内容{% if invisible_reason %} · {{ invisible_reason | e }}{% endif %}</span>
+          {% endif %}
+          {% if views is not none %}
+          <span class="stat-pill">浏览 {{ views }}</span>
+          {% endif %}
+          {% if replies is not none %}
+          <span class="stat-pill">回复 {{ replies }}</span>
+          {% endif %}
+          {% if score is not none %}
+          <span class="stat-pill">赞 {{ score }}</span>
+          {% endif %}
+        </div>
+      </div>
+
+      <!-- 标题与作者栏 -->
+      <div class="header-section">
+        <h1 class="post-title">
+          {% if category %}
+          <span class="category-chip">{{ category | e }}</span>
+          {% endif %}
+          {{ title | e }}
+        </h1>
+        <div class="author-bar">
+          <div class="author-info">
+            {% if author_avatar %}
+            <img class="avatar-img" src="{{ author_avatar | e }}" alt="avatar" />
+            {% else %}
+            <div class="avatar-fallback">{{ author_initial | e }}</div>
+            {% endif %}
+            <div class="author-meta">
+              <div class="author-name-row">
+                <span class="author-name">{{ author | e }}</span>
+                <span class="op-tag">楼主 · 1L</span>
+                {% if author_group %}
+                <span class="group-tag">{{ author_group | e }}</span>
+                {% endif %}
+              </div>
+              {% if author_id %}
+              <div class="author-sub">UID: {{ author_id | e }}</div>
+              {% endif %}
+            </div>
+          </div>
+          {% if created_at %}
+          <div class="post-time">{{ created_at | e }}</div>
+          {% endif %}
+        </div>
+      </div>
+
+      <!-- 主楼正文 -->
+      <div class="content-clip-wrapper">
+        <div class="post-body">
+          {{ content_html }}
+        </div>
+      </div>
+
+      <!-- 评分列表（如 S1 加鹅记录） -->
+      {% if rates %}
+      <div class="rate-section">
+        <div class="rate-header">主楼评分{% if rate_summary %}（{{ rate_summary | e }}）{% endif %}</div>
+        <div class="rate-list">
+          {% for r in rates %}
+          <div class="rate-row">
+            <span class="rate-user">{{ r.user | e }}</span>
+            <span class="rate-score">{{ r.score | e }}</span>
+            <span class="rate-reason">{{ r.reason | e }}</span>
+          </div>
+          {% endfor %}
+        </div>
+      </div>
+      {% endif %}
+
+      <!-- 超长截断或图片省略提示 -->
+      {% if is_truncated or omitted_images_count > 0 %}
+      <div class="notice-banner">
+        {% if is_truncated %}
+        ⚠️ 主楼内容较长，已截断展示前 {{ truncated_at_chars }} 字
+        {% endif %}
+        {% if is_truncated and omitted_images_count > 0 %} · {% endif %}
+        {% if omitted_images_count > 0 %}
+        已省略 {{ omitted_images_count }} 张图片
+        {% endif %}
+        · 请访问下方原帖链接查看完整内容
+      </div>
+      {% endif %}
+
+      <!-- 页脚 -->
+      <div class="footer">
+        <div class="footer-url">{{ url | e }}</div>
+        <div class="footer-brand">AstrBot Forum Parser</div>
+      </div>
+    </div>
+  </div>
+</body>
+</html>

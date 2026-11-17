@@ -1,0 +1,56 @@
+# Python 编译与包产物
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+.eggs/
+wheels/
+pip-wheel-metadata/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+ENV/
+
+# 测试、Lint 与类型检查缓存
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# AstrBot 运行期数据、配置与插件临时文件
+data/
+temp/
+temp_render/
+render_cache/
+scope_*/
+auth_state.json
+*_config.json
+*.tmp
+*.bak
+*.log
+
+# 环境变量与本地密钥
+.env
+.env.*
+!.env.example
+
+# 编辑器与操作系统生成文件
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

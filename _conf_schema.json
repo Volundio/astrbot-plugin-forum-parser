@@ -1,0 +1,289 @@
+{
+  "t2i_endpoint": {
+    "type": "string",
+    "description": "文本转图像服务 (T2I) API 地址",
+    "hint": "可选。填写自建 astrbot-t2i-service 地址（例如 http://127.0.0.1:8999 或 http://127.0.0.1:8999/text2img）。留空则默认使用 AstrBot 全局配置的远程 HTML 渲染服务。",
+    "default": ""
+  },
+  "render_options": {
+    "type": "object",
+    "description": "图片渲染与模板设置",
+    "items": {
+      "theme": {
+        "type": "string",
+        "description": "自定义渲染模板视觉主题",
+        "default": "auto",
+        "options": [
+          "auto",
+          "light",
+          "dark"
+        ],
+        "labels": [
+          "论坛特色自适应（推荐）",
+          "现代极简浅色",
+          "现代柔和深色"
+        ],
+        "subtitles": [
+          "Stage1st 采用经典暖鹅黄配色，NGA 采用经典泥潭浅黄配色",
+          "干净清爽的纯白阅读器卡片风格",
+          "适合夜间阅读的深色卡片风格"
+        ]
+      },
+      "viewport_width": {
+        "type": "int",
+        "description": "渲染卡片宽度 (px)",
+        "default": 780,
+        "slider": {
+          "min": 520,
+          "max": 1200,
+          "step": 20
+        }
+      },
+      "device_scale_factor": {
+        "type": "string",
+        "description": "渲染清晰度倍率",
+        "default": "high",
+        "options": [
+          "normal",
+          "high",
+          "ultra"
+        ],
+        "labels": [
+          "标准 (1.0x)",
+          "高清 (1.3x，推荐)",
+          "超清 (1.8x)"
+        ]
+      },
+      "image_format": {
+        "type": "string",
+        "description": "输出图片格式",
+        "default": "jpeg",
+        "options": [
+          "jpeg",
+          "png"
+        ],
+        "labels": [
+          "JPEG（体积更小，发送更快）",
+          "PNG（无损画质，体积较大）"
+        ]
+      },
+      "jpeg_quality": {
+        "type": "int",
+        "description": "JPEG 图片质量",
+        "default": 90,
+        "slider": {
+          "min": 50,
+          "max": 100,
+          "step": 5
+        }
+      },
+      "embed_images": {
+        "type": "bool",
+        "description": "渲染主楼内嵌图片",
+        "hint": "开启后将自动预下载主楼图片（携带论坛登录态与防盗链请求头）并内嵌到渲染卡片中。",
+        "default": true
+      },
+      "max_inline_images": {
+        "type": "int",
+        "description": "主楼最多内嵌图片数量",
+        "hint": "超出数量的图片将转为文字占位提示，防止多图长帖导致渲染超时或体积过大。",
+        "default": 15
+      },
+      "enable_length_limit": {
+        "type": "bool",
+        "description": "启用超长主楼截断保护",
+        "hint": "开启后对万字长帖或超高页面进行安全截断，避免超出 Telegram 图片尺寸上限（宽高之和 <= 10000px）。",
+        "default": true
+      },
+      "max_content_chars": {
+        "type": "int",
+        "description": "主楼最大正文字数（开启截断保护时生效，0 为不限字数）",
+        "default": 6000
+      },
+      "max_card_height_px": {
+        "type": "int",
+        "description": "卡片最大 CSS 高度 px（开启截断保护时生效，0 为不限高度）",
+        "default": 6200
+      }
+    }
+  },
+  "parse_options": {
+    "type": "object",
+    "description": "链接识别与触发策略",
+    "items": {
+      "allow_alias_domains": {
+        "type": "bool",
+        "description": "兼容官方同源别名域名",
+        "hint": "开启后同时支持 saraba1st.com、ngabbs.com、nga.178.com、g.nga.cn 等同源链接。",
+        "default": true
+      },
+      "parse_share_cards": {
+        "type": "bool",
+        "description": "支持解析分享卡片与富文本超链接",
+        "hint": "支持提取 OneBot11 的 QQ 小程序/JSON 分享卡片以及 Telegram 的超链接实体（text_link）。",
+        "default": true
+      },
+      "max_links_per_message": {
+        "type": "int",
+        "description": "单条消息最多解析的链接数",
+        "default": 2
+      },
+      "max_concurrent_tasks": {
+        "type": "int",
+        "description": "最大并发解析与渲染任务数",
+        "hint": "限制全局同时进行的帖子拉取与渲染数量，防止群聊瞬间刷屏导致内存峰值叠加溢出。",
+        "default": 2,
+        "slider": {
+          "min": 1,
+          "max": 6,
+          "step": 1
+        }
+      },
+      "cooldown_seconds": {
+        "type": "int",
+        "description": "相同帖子重复解析冷却时间（秒，0 为不冷却）",
+        "default": 30
+      },
+      "send_error_hint": {
+        "type": "bool",
+        "description": "自动解析失败时在聊天中发送错误提示",
+        "hint": "默认关闭以避免打扰群聊，仅在后台日志记录错误；手动指令触发时始终提示错误。",
+        "default": false
+      }
+    }
+  },
+  "onebot_options": {
+    "type": "object",
+    "description": "OneBot11 (QQ) 发送设置",
+    "items": {
+      "use_forward": {
+        "type": "bool",
+        "description": "默认使用合并转发发送",
+        "hint": "开启后在 OneBot11 (QQ) 平台默认以合并转发消息形式发送帖子信息与主楼渲染长图；关闭则直接发送单张渲染图片。",
+        "default": true
+      },
+      "forward_include_images": {
+        "type": "bool",
+        "description": "合并转发中一并发送帖子内原图",
+        "hint": "当帖子主楼包含图片（含动图 GIF）时，在合并转发消息中附带发送原图节点，方便单独点开查看或保存。",
+        "default": true
+      },
+      "forward_max_images": {
+        "type": "int",
+        "description": "合并转发最多附带的帖子原图数量",
+        "default": 20,
+        "slider": {
+          "min": 1,
+          "max": 40,
+          "step": 1
+        }
+      }
+    }
+  },
+  "stage1st": {
+    "type": "object",
+    "description": "Stage1st (S1) 论坛配置",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用 Stage1st 帖子解析",
+        "default": true
+      },
+      "username": {
+        "type": "string",
+        "description": "Stage1st 账号用户名",
+        "hint": "配置账号密码后，可自动维持网页登录态并调用 S1 官方 App 接口解锁审核中/禁言不可见内容。",
+        "default": ""
+      },
+      "password": {
+        "type": "string",
+        "description": "Stage1st 账号密码",
+        "default": "",
+        "secret": true
+      },
+      "question_id": {
+        "type": "int",
+        "description": "Stage1st 安全提问类型",
+        "default": 0,
+        "options": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "labels": [
+          "无安全提问（默认）",
+          "母亲的名字",
+          "爷爷的名字",
+          "父亲出生的城市",
+          "您其中一位老师的名字",
+          "您个人计算机的型号",
+          "您最喜欢的餐馆名称",
+          "驾驶执照最后四位数字"
+        ]
+      },
+      "answer": {
+        "type": "string",
+        "description": "Stage1st 安全提问答案",
+        "hint": "未设置安全提问请留空。",
+        "default": "",
+        "secret": true
+      },
+      "enable_invisible_parse": {
+        "type": "bool",
+        "description": "启用不可见内容解析（审核中 / 作者被禁言屏蔽）",
+        "hint": "开启后，当网页端显示“内容审核中”或“作者被禁止或删除 内容自动屏蔽”时，自动通过 S1 官方 App 接口获取主楼原文。",
+        "default": true
+      },
+      "cookie": {
+        "type": "text",
+        "description": "Stage1st 网页 Cookie（可选兜底）",
+        "hint": "若已配置账号密码则会自动登录，一般无需手动填写。",
+        "default": "",
+        "secret": true
+      },
+      "app_sid": {
+        "type": "string",
+        "description": "Stage1st App SID（可选兜底）",
+        "hint": "若已配置账号密码会自动登录获取并持久化刷新；也可手动填入已有 sid。",
+        "default": "",
+        "secret": true
+      }
+    }
+  },
+  "nga": {
+    "type": "object",
+    "description": "NGA 玩家社区配置",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用 NGA 帖子解析",
+        "default": true
+      },
+      "passport_uid": {
+        "type": "string",
+        "description": "NGA 登录 UID (ngaPassportUid)",
+        "hint": "部分版块或受限帖需要登录态才能访问，可填写浏览器 Cookie 中的 ngaPassportUid。",
+        "default": ""
+      },
+      "passport_cid": {
+        "type": "string",
+        "description": "NGA 登录凭证 CID (ngaPassportCid)",
+        "hint": "填写浏览器 Cookie 中的 ngaPassportCid。",
+        "default": "",
+        "secret": true
+      },
+      "cookie": {
+        "type": "text",
+        "description": "NGA 完整 Cookie 字符串（可选）",
+        "hint": "也可直接粘贴完整 Cookie 字符串；若上方已填写 UID 与 CID 则无需重复填写。",
+        "default": "",
+        "secret": true
+      }
+    }
+  }
+}

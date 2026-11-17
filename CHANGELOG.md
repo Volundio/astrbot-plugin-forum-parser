@@ -2,6 +2,16 @@
 
 All notable changes to `astrbot_plugin_forum_parser` will be documented in this file.
 
+## [v0.3.2] - 2026-11-18
+
+### Fixed
+- **Stage1st 论坛附件图片提取与跨境转存修复**：
+  - 优化 Discuz `<img>` 属性候选提取策略（优先保留带鉴权签名参数的链接及懒加载真实 `file` 地址，同时记录 `data-fallback-src` 在主地址返回 `403/404` 时自动回退尝试备选地址）。
+  - 为图片流式下载与内联预取补齐跨境短超时与 `Connection: close` 新连接自动重试（最多 3 次），并在拉取或上传图床失败时通过 `logger.warning` 输出明确状态码与原因。
+- **Telegraph 多图并发加载断流修复（`p.sda1.dev` 边缘缓存串行预热 + 免重传复用）**：
+  - 原帖已托管在 `p.sda1.dev`、`telegra.ph` 等公开免防盗链图床上的图片直接复用原链接，避免无谓重复上传导致热缓存旧链接退化为冷缓存新链接。
+  - 在向 `telegra.ph` 发布页面前，按阅读顺序逐张串行 `GET` 预热图床外链的 Cloudflare 边缘缓存（64KB 分块流式丢弃、零磁盘占用、自动处理首次冷回源断流重试），消除客户端打开页面并发拉取多张冷缓存图片时触发的源站断流（`ERR_CONTENT_LENGTH_MISMATCH`）。
+
 ## [v0.3.1] - 2026-11-18
 
 ### Fixed

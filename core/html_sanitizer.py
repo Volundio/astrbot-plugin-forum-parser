@@ -12,6 +12,7 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse, urlunparse
 
 import aiohttp
+from astrbot.api import logger
 
 from .io_guard import mime_to_ext, sniff_image_mime, stream_response_to_file
 from .temp_manager import TempScope
@@ -455,19 +456,47 @@ def _is_smiley_image(node: MiniNode, resolved_src: str) -> bool:
     )
 
 
-def _extract_discuz_img_url(node: MiniNode, base_url: str) -> str:
-    """提取 Discuz / NGA <img> 真实图片地址（兼容懒加载 none.gif 与 zoomfile/file）。"""
-    for attr_name in ("zoomfile", "file", "data-original", "data-src", "src"):
+def _extract_discuz_img_candidates(node: MiniNode, base_url: str) -> list[str]:
+    """提取 Discuz / NGA <img> 候选真实图片地址列表。
+
+    优先级策略：
+    1. 携带查询鉴权参数（如 S1 阿里云 CDN 签名 `?a=...` 或 `mod=attachment&aid=...`）的地址绝对优先，避免裸链触发 403；
+    2. 同等鉴权条件下，非 `.thumb.` 原图优先于缩略图，且 `file` 属性优先于无签名的静态属性；
+    3. 保留次优候选用于主地址 403/404 时的自动回退重试。
+    """
+    raw_pairs: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for attr_name in ("file", "zoomfile", "data-original", "data-src", "src"):
         candidate = node.get_attr(attr_name).strip()
         if not candidate:
             continue
         low = candidate.lower()
-        if low.endswith(("/none.gif", "/transparent.gif", "common/none.gif")):
+        if low.endswith(("/none.gif", "/transparent.gif", "common/none.gif", "/loading.gif")):
             continue
         resolved = _resolve_url(candidate, base_url)
-        if _is_safe_http_url(resolved):
-            return resolved
-    return ""
+        if _is_safe_http_url(resolved) and resolved not in seen:
+            seen.add(resolved)
+            raw_pairs.append((attr_name, resolved))
+
+    if len(raw_pairs) <= 1:
+        return [u for _, u in raw_pairs]
+
+    def _sort_key(item: tuple[str, str]) -> tuple[int, int, int]:
+        attr_n, u = item
+        parsed = urlparse(u)
+        has_query_rank = 0 if parsed.query else 1
+        is_thumb_rank = 1 if ".thumb." in (parsed.path or "").lower() else 0
+        attr_rank = 0 if attr_n == "file" else (1 if attr_n == "zoomfile" else 2)
+        return (has_query_rank, is_thumb_rank, attr_rank)
+
+    raw_pairs.sort(key=_sort_key)
+    return [u for _, u in raw_pairs]
+
+
+def _extract_discuz_img_url(node: MiniNode, base_url: str) -> str:
+    """提取 Discuz / NGA <img> 首选真实图片地址（兼容懒加载 none.gif 与 file/zoomfile）。"""
+    candidates = _extract_discuz_img_candidates(node, base_url)
+    return candidates[0] if candidates else ""
 
 
 def _sanitize_node_tree(node: MiniNode, base_url: str) -> list[MiniNode]:
@@ -532,9 +561,10 @@ def _sanitize_node_tree(node: MiniNode, base_url: str) -> list[MiniNode]:
 
     # 处理图片节点
     if tag == "img":
-        src = _extract_discuz_img_url(node, base_url)
-        if not src:
+        candidates = _extract_discuz_img_candidates(node, base_url)
+        if not candidates:
             return []
+        src = candidates[0]
         is_smiley = _is_smiley_image(node, src)
         alt = node.get_attr("alt") or ("表情" if is_smiley else "图片")
         if alt.lower() == "attachimg":
@@ -545,6 +575,8 @@ def _sanitize_node_tree(node: MiniNode, base_url: str) -> list[MiniNode]:
             "class": "forum-smiley" if is_smiley else "forum-img",
             "referrerpolicy": "no-referrer",
         }
+        if len(candidates) > 1 and not is_smiley:
+            img_attrs["data-fallback-src"] = candidates[1]
         return [MiniNode(tag="img", attrs=img_attrs)]
 
     # 处理超链接
@@ -686,6 +718,31 @@ def truncate_dom_tree(root: MiniNode, max_chars: int) -> tuple[bool, int]:
     return state["truncated"], state["count"]
 
 
+def _format_dl_exc(exc: BaseException) -> str:
+    msg = str(exc).strip()
+    if isinstance(exc, TimeoutError | asyncio.TimeoutError):
+        return f"连接或读取超时 ({msg})" if msg else "连接或读取超时 (TimeoutError)"
+    return f"{type(exc).__name__}: {msg}" if msg else type(exc).__name__
+
+
+def extract_fallback_url_map(content_html: str) -> dict[int, list[str]]:
+    """从清洗后的楼层 HTML 中提取每张配图的备选回退 URL 列表（如 Discuz file <-> zoomfile 备选链）。"""
+    if not content_html or "data-fallback-src" not in content_html:
+        return {}
+    root = parse_html(content_html)
+    out: dict[int, list[str]] = {}
+    for img_n in root.find_all(tag="img"):
+        idx_s = img_n.get_attr("data-idx")
+        fb = img_n.get_attr("data-fallback-src").strip()
+        if idx_s.isdigit() and fb:
+            idx = int(idx_s)
+            lst = out.setdefault(idx, [])
+            rewritten = rewrite_legacy_media_url(fb)
+            if rewritten not in lst:
+                lst.append(rewritten)
+    return out
+
+
 async def _fetch_image_as_data_uri(
     session: aiohttp.ClientSession,
     url: str,
@@ -694,9 +751,10 @@ async def _fetch_image_as_data_uri(
     cookies: dict[str, str] | None = None,
     same_site_hosts: set[str] | None = None,
     max_bytes: int = MAX_CARD_INLINE_SINGLE_BYTES,
+    fallback_urls: list[str] | tuple[str, ...] = (),
 ) -> str | None:
-    """异步下载单张图片并转换为 Base64 Data URI（带 Content-Length 预检与分块上限防 OOM）。"""
-    headers = {
+    """异步下载单张图片并转换为 Base64 Data URI（支持跨境短超时新连接重试、备选 URL 自动回退与 OOM 预算防线）。"""
+    base_headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -704,50 +762,63 @@ async def _fetch_image_as_data_uri(
         "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
         "Referer": referer,
     }
-    host = (urlparse(url).hostname or "").lower()
-    req_cookies = cookies if (cookies and same_site_hosts and host in same_site_hosts) else None
+    candidates = [url, *(u for u in fallback_urls if u and u != url)]
+    timeout = aiohttp.ClientTimeout(total=12, connect=4, sock_connect=4, sock_read=8)
 
-    try:
-        timeout = aiohttp.ClientTimeout(total=12, connect=5)
-        async with session.get(
-            url,
-            headers=headers,
-            cookies=req_cookies,
-            timeout=timeout,
-            allow_redirects=True,
-        ) as resp:
-            if resp.status != 200:
-                return None
-            cl_hdr = resp.headers.get("Content-Length")
-            if cl_hdr and cl_hdr.isdigit() and int(cl_hdr) > max_bytes:
-                return None
+    for cand_url in candidates:
+        host = (urlparse(cand_url).hostname or "").lower()
+        req_cookies = cookies if (cookies and same_site_hosts and host in same_site_hosts) else None
+        for attempt in range(2):
+            headers = dict(base_headers)
+            if attempt > 0:
+                headers["Connection"] = "close"
+            try:
+                async with session.get(
+                    cand_url,
+                    headers=headers,
+                    cookies=req_cookies,
+                    timeout=timeout,
+                    allow_redirects=True,
+                ) as resp:
+                    if resp.status != 200:
+                        if (resp.status >= 500 or resp.status == 429) and attempt == 0:
+                            continue
+                        break
+                    cl_hdr = resp.headers.get("Content-Length")
+                    if cl_hdr and cl_hdr.isdigit() and int(cl_hdr) > max_bytes:
+                        return None
 
-            ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-            if ctype and not ctype.startswith("image/"):
-                return None
+                    ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+                    if ctype and not ctype.startswith("image/"):
+                        break
 
-            chunks: list[bytes] = []
-            total = 0
-            async for chunk in resp.content.iter_chunked(32768):
-                total += len(chunk)
-                if total > max_bytes:
+                    chunks: list[bytes] = []
+                    total = 0
+                    async for chunk in resp.content.iter_chunked(32768):
+                        total += len(chunk)
+                        if total > max_bytes:
+                            chunks.clear()
+                            return None
+                        chunks.append(chunk)
+
+                    raw = b"".join(chunks)
                     chunks.clear()
-                    return None
-                chunks.append(chunk)
+                    if not raw:
+                        break
 
-            raw = b"".join(chunks)
-            chunks.clear()
-            if not raw:
-                return None
+                    mime = sniff_image_mime(raw[:16], fallback=ctype or "image/png")
+                    if mime == "image/svg+xml":
+                        return None
 
-            mime = sniff_image_mime(raw[:16], fallback=ctype or "image/png")
-            if mime == "image/svg+xml":
-                return None
-
-            b64 = base64.b64encode(raw).decode("ascii")
-            return f"data:{mime};base64,{b64}"
-    except Exception:
-        return None
+                    b64 = base64.b64encode(raw).decode("ascii")
+                    return f"data:{mime};base64,{b64}"
+            except Exception as e:
+                if attempt == 0:
+                    logger.debug(
+                        f"内联拉取图片第 1 次异常，换新连接重试 ({cand_url}): {_format_dl_exc(e)}"
+                    )
+                    continue
+    return None
 
 
 def _data_uri_raw_byte_len(data_uri: str) -> int:
@@ -857,12 +928,19 @@ async def process_post_html(
             # 预下载表情（最多 30 个唯一 URL）与主楼图片，解决防盗链与需登录附件问题
             targets: list[MiniNode] = allowed_post_imgs + smiley_imgs[:40]
             unique_urls: list[str] = []
+            url_fallbacks: dict[str, list[str]] = {}
             seen_u: set[str] = set()
             for n in targets:
                 u = n.get_attr("src")
-                if u and u not in seen_u:
-                    seen_u.add(u)
-                    unique_urls.append(u)
+                fb = n.get_attr("data-fallback-src").strip()
+                if u:
+                    if fb:
+                        fb_list = url_fallbacks.setdefault(u, [])
+                        if fb not in fb_list:
+                            fb_list.append(fb)
+                    if u not in seen_u:
+                        seen_u.add(u)
+                        unique_urls.append(u)
 
             sem = asyncio.Semaphore(3)
             total_inline_budget = MAX_CARD_INLINE_TOTAL_BYTES
@@ -882,6 +960,7 @@ async def process_post_html(
                         cookies=cookies,
                         same_site_hosts=same_site_hosts,
                         max_bytes=min(MAX_CARD_INLINE_SINGLE_BYTES, remain),
+                        fallback_urls=url_fallbacks.get(u, ()),
                     )
                     return u, uri
 
@@ -940,9 +1019,11 @@ async def _stream_single_image_to_scope(
     cookies: dict[str, str] | None,
     same_site_hosts: set[str] | None,
     max_bytes: int,
+    fallback_urls: list[str] | tuple[str, ...] = (),
+    error_out: list[str] | None = None,
 ) -> tuple[Path | None, int]:
-    """将单张论坛原图按 64KB 分块直接流式写入请求私有临时目录（峰值内存仅 64KB）。"""
-    headers = {
+    """将单张论坛原图按 64KB 分块直接流式写入请求私有临时目录（峰值内存仅 64KB，支持跨境重试与备选 URL 回退）。"""
+    base_headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
@@ -950,33 +1031,66 @@ async def _stream_single_image_to_scope(
         "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
         "Referer": referer,
     }
-    host = (urlparse(url).hostname or "").lower()
-    req_cookies = cookies if (cookies and same_site_hosts and host in same_site_hosts) else None
+    candidates = [url, *(u for u in fallback_urls if u and u != url)]
+    timeout = aiohttp.ClientTimeout(total=16, connect=4, sock_connect=4, sock_read=10)
+    last_reason = ""
 
-    try:
-        timeout = aiohttp.ClientTimeout(total=18, connect=5)
-        async with session.get(
-            url,
-            headers=headers,
-            cookies=req_cookies,
-            timeout=timeout,
-            allow_redirects=True,
-        ) as resp:
-            if resp.status != 200:
-                return None, 0
-            ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-            if ctype and (not ctype.startswith("image/") or ctype == "image/svg+xml"):
-                return None, 0
+    for cand_url in candidates:
+        host = (urlparse(cand_url).hostname or "").lower()
+        req_cookies = cookies if (cookies and same_site_hosts and host in same_site_hosts) else None
+        for attempt in range(3):
+            headers = dict(base_headers)
+            if attempt > 0:
+                headers["Connection"] = "close"
+            dest: Path | None = None
+            try:
+                async with session.get(
+                    cand_url,
+                    headers=headers,
+                    cookies=req_cookies,
+                    timeout=timeout,
+                    allow_redirects=True,
+                ) as resp:
+                    if resp.status != 200:
+                        last_reason = f"HTTP {resp.status}"
+                        if (resp.status >= 500 or resp.status == 429) and attempt + 1 < 3:
+                            continue
+                        break
+                    ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+                    if ctype and (not ctype.startswith("image/") or ctype == "image/svg+xml"):
+                        last_reason = f"非预期 Content-Type ({ctype})"
+                        break
 
-            ext = mime_to_ext(ctype)
-            dest = scope.alloc_file(prefix="post_img", ext=ext)
-            written, detected_mime = await stream_response_to_file(resp, dest, max_bytes=max_bytes)
-            if detected_mime == "image/svg+xml":
-                await asyncio.to_thread(dest.unlink, True)
+                    ext = mime_to_ext(ctype)
+                    dest = scope.alloc_file(prefix="post_img", ext=ext)
+                    written, detected_mime = await stream_response_to_file(
+                        resp, dest, max_bytes=max_bytes
+                    )
+                    if detected_mime == "image/svg+xml":
+                        await asyncio.to_thread(dest.unlink, True)
+                        last_reason = "跳过 SVG 矢量文件"
+                        return None, 0
+                    return dest, written
+            except ValueError as ve:
+                if dest is not None:
+                    await asyncio.to_thread(dest.unlink, True)
+                last_reason = str(ve) or "图片超出体积上限"
+                if error_out is not None:
+                    error_out.append(last_reason)
                 return None, 0
-            return dest, written
-    except Exception:
-        return None, 0
+            except Exception as e:
+                if dest is not None:
+                    await asyncio.to_thread(dest.unlink, True)
+                last_reason = _format_dl_exc(e)
+                if attempt + 1 < 3:
+                    logger.debug(
+                        f"流式下载论坛图片第 {attempt + 1} 次异常，换新连接重试 ({cand_url}): {last_reason}"
+                    )
+                    continue
+
+    if error_out is not None and last_reason:
+        error_out.append(last_reason)
+    return None, 0
 
 
 async def prepare_post_images_for_forward(
@@ -1036,6 +1150,7 @@ async def prepare_post_images_for_forward(
     # 2. 对未内嵌的图片按低并发（2 路）64KB 分块直接流式落盘
     if session is not None and used_file_bytes < max_total_bytes:
         sem = asyncio.Semaphore(2)
+        fallback_map = extract_fallback_url_map(content_html)
         missing = [i for i in range(len(target_urls)) if i not in idx_to_file]
 
         for batch_start in range(0, len(missing), 2):
@@ -1057,6 +1172,7 @@ async def prepare_post_images_for_forward(
                         cookies=cookies,
                         same_site_hosts=same_site_hosts,
                         max_bytes=eff_cap,
+                        fallback_urls=fallback_map.get(idx, ()),
                     )
                     return idx, p, sz
 

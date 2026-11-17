@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,7 @@ from .html_sanitizer import (
     _data_uri_raw_byte_len,
     _decode_data_uri_to_file_sync,
     _stream_single_image_to_scope,
+    extract_fallback_url_map,
     parse_html,
     rewrite_legacy_media_url,
 )
@@ -32,6 +34,32 @@ DEFAULT_SDA1_UPLOAD_URL = "https://p.sda1.dev/api/v1/upload_external_noform"
 
 # Telegraph 单页 content JSON 最大限制为 64KB，预留安全余量按 54KB 自动分页
 MAX_TELEGRAPH_CONTENT_BYTES = 54 * 1024
+
+# 针对图床刚上传冷缓存图片的串行预热总时长预算（秒），避免超多图长帖阻塞响应过久
+MAX_TOTAL_PREWARM_SECONDS = 25.0
+
+PUBLIC_EXEMPT_IMAGE_HOSTS = frozenset({"p.sda1.dev", "telegra.ph", "files.catbox.moe"})
+
+
+def _normalize_exempt_bed_url(raw_url: str, upload_url: str) -> str | None:
+    """若原帖图片本身已托管在 p.sda1.dev 等公开免防盗链图床，直接规范化为 HTTPS 复用，避免重复重传导致热缓存退化为冷缓存。"""
+    cleaned = rewrite_legacy_media_url((raw_url or "").strip())
+    if not cleaned.startswith(("http://", "https://")):
+        return None
+    try:
+        parsed = urlparse(cleaned)
+    except ValueError:
+        return None
+    host = (parsed.hostname or "").lower()
+    if not host or parsed.path.startswith("/api/"):
+        return None
+    upload_host = (urlparse(upload_url or DEFAULT_SDA1_UPLOAD_URL).hostname or "").lower()
+    if host in PUBLIC_EXEMPT_IMAGE_HOSTS or (upload_host and host == upload_host):
+        if cleaned.startswith("http://"):
+            return "https://" + cleaned.removeprefix("http://")
+        return cleaned
+    return None
+
 
 SMILEY_CODE_FROM_URL_RE = re.compile(r"/smiley/([^/]+)/([^/.?]+)", re.IGNORECASE)
 
@@ -598,6 +626,7 @@ class TelegraphPublisher:
         """按 Binary 请求体调用 POST https://p.sda1.dev/api/v1/upload_external_noform?filename=... 上传单张图片。"""
         target_ep = (upload_url or DEFAULT_SDA1_UPLOAD_URL).strip()
         timeout = aiohttp.ClientTimeout(total=25, connect=5, sock_connect=5, sock_read=15)
+        last_err = ""
 
         for attempt in range(2):
             headers = {
@@ -616,9 +645,10 @@ class TelegraphPublisher:
                         timeout=timeout,
                     ) as resp:
                         if resp.status != 200:
-                            if resp.status >= 500 and attempt == 0:
+                            last_err = f"HTTP {resp.status}"
+                            if (resp.status >= 500 or resp.status == 429) and attempt == 0:
                                 continue
-                            return None
+                            break
                         payload = await resp.json(content_type=None)
                         if isinstance(payload, dict) and payload.get("success"):
                             u = str((payload.get("data") or {}).get("url") or "").strip()
@@ -626,12 +656,94 @@ class TelegraphPublisher:
                                 return u
                             if u.startswith("http://"):
                                 return "https://" + u.removeprefix("http://")
-                        return None
+                        last_err = str(
+                            (payload or {}).get("message")
+                            or (payload or {}).get("code")
+                            or "响应未返回有效图床 URL"
+                        )
+                        break
             except Exception as e:
-                logger.debug(f"上传图片至图床第 {attempt + 1} 次异常 ({filename}): {e}")
+                last_err = str(e).strip() or type(e).__name__
+                logger.debug(f"上传图片至图床第 {attempt + 1} 次异常 ({filename}): {last_err}")
                 if attempt == 0:
                     continue
+        if last_err:
+            logger.warning(f"上传配图至图床失败 ({filename}): {last_err}")
         return None
+
+    async def _warm_single_image_url(self, url: str) -> bool:
+        """串行流式预热单张图床 URL 的 Cloudflare 边缘缓存（峰值内存仅 64KB，零磁盘占用）。
+
+        p.sda1.dev 刚上传的图片处于冷缓存 (MISS)，浏览器并发拉取多张冷缓存图片会触发源站并发断流；
+        在发布 Telegraph 前逐张串行拉取一遍可将其预热为 HIT。
+        """
+        timeout = aiohttp.ClientTimeout(total=12, connect=4, sock_connect=4, sock_read=8)
+        for attempt in range(2):
+            headers = {
+                "User-Agent": DEFAULT_BROWSER_UA,
+                "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+                "Referer": "https://telegra.ph/",
+            }
+            if attempt > 0:
+                headers["Connection"] = "close"
+            try:
+                async with self.session.get(
+                    url,
+                    headers=headers,
+                    timeout=timeout,
+                    allow_redirects=True,
+                ) as resp:
+                    if resp.status == 200:
+                        drained = 0
+                        async for chunk in resp.content.iter_chunked(65536):
+                            drained += len(chunk)
+                            if drained > MAX_FORWARD_SINGLE_IMAGE_BYTES:
+                                break
+                        return True
+                    if (resp.status >= 500 or resp.status == 429) and attempt == 0:
+                        await asyncio.sleep(0.2)
+                        continue
+                    return False
+            except Exception as e:
+                logger.debug(f"串行预热图床缓存第 {attempt + 1} 次异常 ({url}): {e}")
+                if attempt == 0:
+                    await asyncio.sleep(0.2)
+                    continue
+        return False
+
+    async def _warm_hosted_images_serially(
+        self,
+        urls: list[str],
+        *,
+        upload_url: str = DEFAULT_SDA1_UPLOAD_URL,
+    ) -> None:
+        """按阅读顺序逐张串行预热图床外链缓存，消除客户端打开 Telegraph 页面时的并发回源断流。"""
+        if not urls:
+            return
+        upload_host = (urlparse(upload_url or DEFAULT_SDA1_UPLOAD_URL).hostname or "").lower()
+        warm_hosts = {"p.sda1.dev"}
+        if upload_host:
+            warm_hosts.add(upload_host)
+
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for u in urls:
+            if not u or u in seen:
+                continue
+            h = (urlparse(u).hostname or "").lower()
+            if h in warm_hosts:
+                seen.add(u)
+                deduped.append(u)
+
+        if not deduped:
+            return
+
+        deadline = time.monotonic() + MAX_TOTAL_PREWARM_SECONDS
+        for u in deduped:
+            if time.monotonic() >= deadline:
+                logger.debug("图床串行预热已达总时长预算上限，跳过剩余图片预热。")
+                break
+            await self._warm_single_image_url(u)
 
     async def _rehost_post_images(
         self,
@@ -656,6 +768,7 @@ class TelegraphPublisher:
                 if uri and idx_s.isdigit():
                     idx_to_inlined_uri[int(idx_s)] = uri
 
+        fallback_map = extract_fallback_url_map(thread.content_html)
         url_map: dict[str, str] = {}
         idx_map: dict[int, str] = {}
         used_bytes = 0
@@ -665,15 +778,25 @@ class TelegraphPublisher:
         async def _process_one(idx: int, orig_url: str) -> None:
             nonlocal used_bytes
             async with sem:
+                inlined = idx_to_inlined_uri.get(idx)
+                if not inlined:
+                    exempt_https = _normalize_exempt_bed_url(orig_url, upload_url)
+                    if exempt_https:
+                        idx_map[idx] = exempt_https
+                        url_map[orig_url] = exempt_https
+                        url_map[rewrite_legacy_media_url(orig_url)] = exempt_https
+                        return
+
                 remain = MAX_FORWARD_TOTAL_FILE_BYTES - used_bytes
                 if remain <= 0:
                     return
                 eff_cap = min(MAX_FORWARD_SINGLE_IMAGE_BYTES, remain)
                 local_file: Path | None = None
                 written = 0
+                clean_u = rewrite_legacy_media_url(orig_url)
+                dl_errs: list[str] = []
 
                 try:
-                    inlined = idx_to_inlined_uri.get(idx)
                     if inlined:
                         est_sz = _data_uri_raw_byte_len(inlined)
                         if est_sz <= eff_cap:
@@ -684,8 +807,9 @@ class TelegraphPublisher:
                                 _decode_data_uri_to_file_sync, inlined, dest
                             )
                             local_file = dest
+                        else:
+                            dl_errs.append("内嵌图片超出体积预算")
                     else:
-                        clean_u = rewrite_legacy_media_url(orig_url)
                         local_file, written = await _stream_single_image_to_scope(
                             self.session,
                             clean_u,
@@ -694,9 +818,16 @@ class TelegraphPublisher:
                             cookies=cookies,
                             same_site_hosts=same_site_hosts,
                             max_bytes=eff_cap,
+                            fallback_urls=fallback_map.get(idx, ()),
+                            error_out=dl_errs,
                         )
 
                     if local_file is None or written <= 0:
+                        reason = dl_errs[-1] if dl_errs else "原图响应为空或非图片类型"
+                        logger.warning(
+                            f"Telegraph 配图原图拉取失败，未能上传图床 "
+                            f"(第 {idx + 1} 张, url={clean_u}): {reason}"
+                        )
                         return
                     used_bytes += written
 
@@ -710,9 +841,9 @@ class TelegraphPublisher:
                     if hosted_url:
                         idx_map[idx] = hosted_url
                         url_map[orig_url] = hosted_url
-                        url_map[rewrite_legacy_media_url(orig_url)] = hosted_url
+                        url_map[clean_u] = hosted_url
                 except Exception as e:
-                    logger.debug(f"转存帖子第 {idx + 1} 张配图至图床跳过: {e}")
+                    logger.warning(f"转存帖子第 {idx + 1} 张配图至图床异常 ({clean_u}): {e}")
                 finally:
                     if local_file is not None:
                         await asyncio.to_thread(local_file.unlink, True)
@@ -725,6 +856,10 @@ class TelegraphPublisher:
                 for i in range(batch_start, min(batch_start + 2, len(target_urls)))
             ]
             await asyncio.gather(*(_process_one(i, u) for i, u in batch))
+
+        # 按阅读顺序逐张串行预热图床边缘缓存，防止浏览器打开 Telegraph 时并发回源被掐断
+        ordered_hosted = [idx_map[i] for i in sorted(idx_map)]
+        await self._warm_hosted_images_serially(ordered_hosted, upload_url=upload_url)
 
         return url_map, idx_map
 

@@ -8,4 +8,4 @@ repo: https://github.com/Volundio/astrbot-plugin-forum-parser
 support_platforms:
   - aiocqhttp
   - telegram
-astrbot_version: ">=4.10.0,<5"
+astrbot_version: ">=4.10.0"

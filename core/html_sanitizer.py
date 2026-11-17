@@ -772,6 +772,7 @@ async def process_post_html(
     cookies: dict[str, str] | None = None,
     same_site_hosts: set[str] | None = None,
     embed_images: bool = True,
+    prefetch_data_uri: bool = True,
     max_inline_images: int = 15,
     enable_length_limit: bool = False,
     max_content_chars: int = 15000,
@@ -852,7 +853,7 @@ async def process_post_html(
                 img_node.attrs = {}
                 img_node.children = []
 
-        if session is not None:
+        if session is not None and prefetch_data_uri:
             # 预下载表情（最多 30 个唯一 URL）与主楼图片，解决防盗链与需登录附件问题
             targets: list[MiniNode] = allowed_post_imgs + smiley_imgs[:40]
             unique_urls: list[str] = []

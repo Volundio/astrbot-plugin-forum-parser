@@ -12,7 +12,7 @@
 - **多平台与富媒体链接提取**
   - 支持 **OneBot v11 (`aiocqhttp`)** 与 **Telegram (`telegram`)** 平台。
   - **OneBot v11 默认合并转发**：在 QQ 平台默认以合并转发消息形式发送（包含帖子标题与原帖链接、主楼完整渲染长图，以及帖子主楼内的所有配图/GIF 原图节点，可在设置中调整）。
-  - **Telegram 无损完整长图推送**：在 Telegram 平台仅推送自定义模板渲染生成的单张主楼完整长图，并固定采用原图文件方式（Send as File / `send_document`）推送，避免 `sendPhoto` 压缩模糊及 `10000px` 高度限制。
+  - **Telegram 默认 Telegraph 即时预览（Instant View）+ 长图自动兜底**：在 Telegram 平台默认将解析后的帖子内容发布至 `telegra.ph`（帖子配图自动携带论坛 Cookie 流式下载并通过 `p.sda1.dev` 二进制接口转存以破除防盗链），仅推送纯粹的 `telegra.ph` 链接触发 Telegram 原生 ⚡ Instant View 阅读；若 `telegra.ph` 偶发不可用则自动回退为现有的自定义模板渲染长图无损文件（Send as File）发送（也可在设置中固定切换为长图模式）。
   - 除纯文本 URL 外，自动提取 QQ 小程序 / JSON 分享卡片（含 `c.pc.qq.com` 嵌套跳转解包）及 Telegram 消息中的超链接实体（`text_link`）。
 - **专属自定义 HTML 渲染模板**
   - 不使用默认纯文本文转图模板，内置专为论坛主楼阅读排版的 `HTML + Jinja2` 卡片模板。
@@ -47,6 +47,7 @@ git clone https://github.com/Volundio/astrbot-plugin-forum-parser.git astrbot_pl
 | 顶层配置 | `t2i_endpoint` | 文本转图像服务 API 地址（如 `http://127.0.0.1:8999`）。留空则使用 AstrBot 全局远程渲染服务。 |
 | `render_options` | `theme` / `viewport_width` / `device_scale_factor` / `embed_images` / `enable_length_limit` | 控制卡片配色主题、宽度、清晰度倍率、主楼图片内嵌数量上限以及超长帖截断保护。 |
 | `parse_options` | `allow_alias_domains` / `parse_share_cards` / `cooldown_seconds` | 控制同源别名域名开关、QQ JSON 卡片/TG 超链接提取以及同帖重复触发冷却时间。 |
+| `telegram_options` | `delivery_mode` / `fallback_to_image` / `image_upload_url` / `max_upload_images` | 控制 Telegram 推送方式（默认 `telegraph` 即时预览或 `image_file` 渲染长图）、失败长图兜底开关以及 `p.sda1.dev` 配图转存设置。 |
 | `onebot_options` | `use_forward` / `forward_include_images` / `forward_max_images` | 控制 QQ (OneBot11) 默认合并转发开关、是否在合并转发中一并附带帖子原图及原图数量上限。 |
 | `stage1st` | `username` / `password` / `question_id` / `answer` / `enable_invisible_parse` | 配置 S1 账号密码（可选安全提问、Cookie 或 `app_sid` 兜底），开启后自动解锁审核中与禁言屏蔽内容。 |
 | `nga` | `passport_uid` / `passport_cid` / `cookie` | 配置浏览器登录 NGA 后的 `ngaPassportUid` 与 `ngaPassportCid`（或完整 Cookie 字符串）。 |

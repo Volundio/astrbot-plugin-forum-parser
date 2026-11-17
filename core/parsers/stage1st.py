@@ -864,6 +864,7 @@ class Stage1stParser(BaseForumParser):
         link: ForumLink,
         *,
         embed_images: bool = True,
+        prefetch_data_uri: bool = True,
         max_inline_images: int = 15,
         enable_length_limit: bool = False,
         max_content_chars: int = 15000,
@@ -1073,6 +1074,7 @@ class Stage1stParser(BaseForumParser):
             cookies=web_cookies,
             same_site_hosts=S1_SAME_SITE_HOSTS,
             embed_images=embed_images,
+            prefetch_data_uri=prefetch_data_uri,
             max_inline_images=max_inline_images,
             enable_length_limit=enable_length_limit,
             max_content_chars=max_content_chars,
@@ -1081,7 +1083,7 @@ class Stage1stParser(BaseForumParser):
 
         # 预下载发言人头像为 Data URI 防止远端渲染器无法加载防盗链头像
         author_avatar = rewrite_legacy_media_url(author_avatar)
-        if embed_images and author_avatar.startswith("http"):
+        if embed_images and prefetch_data_uri and author_avatar.startswith("http"):
             av_data = await _fetch_image_as_data_uri(
                 self.session,
                 author_avatar,

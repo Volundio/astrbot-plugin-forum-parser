@@ -26,6 +26,7 @@ if __package__:
     )
     from .core.parsers import NgaParser, Stage1stParser
     from .core.renderer import ForumCardRenderer
+    from .core.telegraph_publisher import DEFAULT_SDA1_UPLOAD_URL, TelegraphPublisher
     from .core.temp_manager import BoundedTTLCache, TempFileManager, TempScope
     from .core.url_extractor import (
         CooldownTracker,
@@ -45,6 +46,7 @@ else:
     )
     from core.parsers import NgaParser, Stage1stParser
     from core.renderer import ForumCardRenderer
+    from core.telegraph_publisher import DEFAULT_SDA1_UPLOAD_URL, TelegraphPublisher
     from core.temp_manager import BoundedTTLCache, TempFileManager, TempScope
     from core.url_extractor import (
         CooldownTracker,
@@ -166,6 +168,7 @@ class ForumParserPlugin(Star):
         self._s1_parser: Stage1stParser | None = None
         self._nga_parser: NgaParser | None = None
         self._renderer: ForumCardRenderer | None = None
+        self._telegraph_publisher: TelegraphPublisher | None = None
         self._gc_task: asyncio.Task[None] | None = None
 
     def _resolve_plugin_data_dir(self) -> Path:
@@ -241,11 +244,22 @@ class ForumParserPlugin(Star):
                 temp_dir=self._temp_dir,
                 temp_manager=self._temp_mgr,
             )
+            self._telegraph_publisher = TelegraphPublisher(
+                self._http_session,
+                kv_getter=self._kv_get,
+                kv_setter=self._kv_set,
+            )
         else:
             if self._s1_parser is not None:
                 self._s1_parser.update_config(self._get_sub_cfg("stage1st"))
             if self._nga_parser is not None:
                 self._nga_parser.update_config(self._get_sub_cfg("nga"))
+            if self._telegraph_publisher is None:
+                self._telegraph_publisher = TelegraphPublisher(
+                    self._http_session,
+                    kv_getter=self._kv_get,
+                    kv_setter=self._kv_set,
+                )
 
         if self._gc_task is None or self._gc_task.done():
             with contextlib.suppress(RuntimeError):
@@ -426,23 +440,95 @@ class ForumParserPlugin(Star):
         *,
         bypass_cache: bool = False,
     ) -> Any:
-        """在全局并发信号量与独立 TempScope 保护下完成解析、远程渲染与消息构建。"""
+        """在全局并发信号量与独立 TempScope 保护下完成解析、Telegraph 发布或远程渲染与消息构建。"""
         self._ensure_services()
         assert self._s1_parser is not None
         assert self._nga_parser is not None
         assert self._renderer is not None
+        assert self._telegraph_publisher is not None
 
         async with self._task_limiter.acquire():
+            platform_name = ""
+            if hasattr(event, "get_platform_name") and callable(event.get_platform_name):
+                platform_name = str(event.get_platform_name() or "").lower()
+
             render_opts = self._get_sub_cfg("render_options")
             embed_images = bool(render_opts.get("embed_images", True))
             max_inline_images = int(render_opts.get("max_inline_images", 15))
             enable_length_limit = bool(render_opts.get("enable_length_limit", False))
             max_content_chars = int(render_opts.get("max_content_chars", 15000))
 
+            tg_opts = self._get_sub_cfg("telegram_options")
+            tg_mode = str(tg_opts.get("delivery_mode") or "telegraph").strip().lower()
+            use_telegraph = platform_name == "telegram" and tg_mode == "telegraph"
+            tg_max_images = int(tg_opts.get("max_upload_images", 25))
+            tg_upload_url = str(tg_opts.get("image_upload_url") or DEFAULT_SDA1_UPLOAD_URL).strip()
+            tg_fallback_to_image = bool(tg_opts.get("fallback_to_image", True))
+
+            parser = self._s1_parser if link.forum == ForumType.STAGE1ST else self._nga_parser
+
+            # 1. Telegram 默认优先走 telegra.ph 即时预览发布（跳过 Base64 内存预加载，配图流式上传至 p.sda1.dev）
+            if use_telegraph:
+                tg_cache_key = (
+                    link.forum.value,
+                    link.target_id,
+                    embed_images,
+                    False,
+                    tg_max_images,
+                    enable_length_limit,
+                    max_content_chars,
+                )
+                tg_from_cache = False
+                tg_thread = None if bypass_cache else self._parse_cache.get(tg_cache_key)
+                if tg_thread is not None:
+                    tg_from_cache = True
+                else:
+                    tg_thread = await parser.parse_thread(
+                        link,
+                        embed_images=embed_images,
+                        prefetch_data_uri=False,
+                        max_inline_images=tg_max_images,
+                        enable_length_limit=enable_length_limit,
+                        max_content_chars=max_content_chars,
+                    )
+                    self._parse_cache.set(tg_cache_key, tg_thread)
+                    tg_from_cache = self._parse_cache.get(tg_cache_key) is tg_thread
+
+                try:
+                    if tg_thread.forum == ForumType.STAGE1ST:
+                        cookies, same_hosts = await self._s1_parser.get_media_auth_context()
+                    else:
+                        cookies, same_hosts = self._nga_parser.get_media_auth_context()
+
+                    telegraph_url = await self._telegraph_publisher.publish_thread(
+                        tg_thread,
+                        temp_scope,
+                        cookies=cookies,
+                        same_site_hosts=same_hosts,
+                        upload_images=embed_images,
+                        upload_url=tg_upload_url,
+                        max_upload_images=tg_max_images,
+                    )
+                    if not tg_from_cache:
+                        tg_thread.content_html = ""
+                        tg_thread.author_avatar = ""
+                    await temp_scope.cleanup()
+                    # 按约定仅发送纯粹的 telegra.ph 链接，不附带额外文字，直接触发 Telegram 原生 Instant View
+                    return event.plain_result(telegraph_url)
+                except Exception as e:
+                    if not tg_fallback_to_image:
+                        await temp_scope.cleanup()
+                        raise
+                    logger.warning(
+                        f"发布至 telegra.ph 失败，自动回退为自定义模板长图发送 ({link.canonical_url}): {e}"
+                    )
+
+            # 2. 常规长图渲染路径（用于 OneBot11、Telegram image_file 模式及 Telegraph 失败自动兜底）
             cache_key = (
                 link.forum.value,
                 link.target_id,
                 embed_images,
+                True,
                 max_inline_images,
                 enable_length_limit,
                 max_content_chars,
@@ -452,10 +538,10 @@ class ForumParserPlugin(Star):
             if parsed_thread is not None:
                 from_cache = True
             else:
-                parser = self._s1_parser if link.forum == ForumType.STAGE1ST else self._nga_parser
                 parsed_thread = await parser.parse_thread(
                     link,
                     embed_images=embed_images,
+                    prefetch_data_uri=True,
                     max_inline_images=max_inline_images,
                     enable_length_limit=enable_length_limit,
                     max_content_chars=max_content_chars,
@@ -477,10 +563,6 @@ class ForumParserPlugin(Star):
             try:
                 self._attach_scope_to_event(event, temp_scope)
 
-                platform_name = ""
-                if hasattr(event, "get_platform_name") and callable(event.get_platform_name):
-                    platform_name = str(event.get_platform_name() or "").lower()
-
                 onebot_opts = self._get_sub_cfg("onebot_options")
                 use_onebot_forward = bool(onebot_opts.get("use_forward", True))
 
@@ -489,7 +571,7 @@ class ForumParserPlugin(Star):
                         event, parsed_thread, render_res, onebot_opts, temp_scope
                     )
                 elif platform_name == "telegram":
-                    # Telegram 平台统一仅推送自定义模板渲染的长图，并固定走无损文件形式 (send as file / send_document)
+                    # Telegram 长图模式（或 Telegraph 失败兜底）：仅推送单张完整长图，固定走无损文件形式 (Send as File)
                     ext = "png" if render_res.mime_type == "image/png" else "jpg"
                     tid_part = parsed_thread.tid or link.tid
                     floor_suffix = (

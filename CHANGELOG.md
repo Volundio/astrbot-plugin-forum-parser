@@ -2,6 +2,15 @@
 
 All notable changes to `astrbot_plugin_forum_parser` will be documented in this file.
 
+## [v0.3.0] - 2026-11-18
+
+### Added
+- **Telegram `telegra.ph` 即时预览（Instant View）发布支持**：
+  - Telegram 平台默认改为发布解析后的帖子（主楼或指定楼层）至 `telegra.ph`，仅返回干净的 `telegra.ph` 链接以触发原生 ⚡ Instant View 阅读体验。
+  - **配图自动流式转存 `p.sda1.dev`**：帖子配图携带论坛登录态与防盗链请求头流式下载至临时作用域，通过 `POST https://p.sda1.dev/api/v1/upload_external_noform?filename=...`（Binary 请求体）转存为无防盗链 HTTPS 直链写入 Telegraph，单张传完即刻删除临时文件，防止内存堆积与磁盘残留。
+  - **富文本语义映射与超长帖自动分页**：完整适配引用块、删除线、反白剧透提示、展开折叠块、表格转列表及 S1 评分记录；超出 Telegraph 单页 64KB 限制时自动切分多页并生成下一页续读链接；自动创建并持久化复用 `telegraph_access_token`。
+  - **渲染长图自动兜底与模式可配**：新增 `telegram_options` 配置分组，当 `telegra.ph` 偶发超时失败时自动回退为现有的自定义 HTML 模板渲染长图（Send as File）发送，也支持在设置中手动切换回固定长图模式。
+
 ## [v0.2.1] - 2026-11-17
 
 ### Improved

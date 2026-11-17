@@ -261,19 +261,51 @@ async def test_plugin_end_to_end_aiocqhttp_and_telegram_tall_image(tmp_path: Pat
     assert len(qq_direct_outputs) == 1
     assert qq_direct_outputs[0].kind == "image"
 
-    # Telegram 平台始终仅推送自定义模板渲染的主楼完整长图，并固定以 File (send as file) 方式发送
+    # Telegram 平台默认走 telegra.ph 即时预览发布（配图上传至 p.sda1.dev，仅返回纯链接不附带多余文字）
+    mocked.post(
+        "https://p.sda1.dev/api/v1/upload_external_noform?filename=nga_12345_1.png",
+        status=200,
+        payload={"success": True, "data": {"url": "https://p.sda1.dev/36/aaa/nga_12345_1.png"}},
+    )
+    mocked.post(
+        "https://p.sda1.dev/api/v1/upload_external_noform?filename=nga_12345_2.png",
+        status=200,
+        payload={"success": True, "data": {"url": "https://p.sda1.dev/36/bbb/nga_12345_2.png"}},
+    )
+    mocked.post(
+        "https://api.telegra.ph/createAccount",
+        status=200,
+        payload={"ok": True, "result": {"access_token": "tg_token_abc"}},
+    )
+    mocked.post(
+        "https://api.telegra.ph/createPage",
+        status=200,
+        payload={"ok": True, "result": {"url": "https://telegra.ph/NGA-12345-11-18"}},
+    )
+
     ev_tg = AstrMessageEvent(
         "分享个帖 https://bbs.nga.cn/read.php?tid=12345",
         platform_name="telegram",
     )
-    tg_outputs = [r async for r in plugin.on_forum_link_message(ev_tg)]
-    assert len(tg_outputs) == 1
-    assert tg_outputs[0].kind == "chain"
-    assert len(tg_outputs[0].payload) == 1
-    assert isinstance(tg_outputs[0].payload[0], Comp.File)
-    assert tg_outputs[0].payload[0].name == "nga_12345.png"
+    tg_iv_outputs = [r async for r in plugin.on_forum_link_message(ev_tg)]
+    assert len(tg_iv_outputs) == 1
+    assert tg_iv_outputs[0].kind == "plain"
+    assert tg_iv_outputs[0].payload == "https://telegra.ph/NGA-12345-11-18"
 
-    # 即使渲染图尺寸很小（未超 10000px 普通图片限制），Telegram 也依然固定走 Comp.File 且不附带额外节点
+    # 验证当 telegra.ph 发布失败（例如返回 502）时，自动回退为现有的自定义模板渲染长图文件 (Send as File)
+    mocked._queues[("POST", "https://api.telegra.ph/createPage")].clear()
+    mocked.post("https://api.telegra.ph/createPage", status=502, body=b"Bad Gateway")
+    mocked.post("https://api.telegra.ph/createPage", status=502, body=b"Bad Gateway")
+
+    tg_fallback_outputs = [r async for r in plugin.on_forum_link_message(ev_tg)]
+    assert len(tg_fallback_outputs) == 1
+    assert tg_fallback_outputs[0].kind == "chain"
+    assert len(tg_fallback_outputs[0].payload) == 1
+    assert isinstance(tg_fallback_outputs[0].payload[0], Comp.File)
+    assert tg_fallback_outputs[0].payload[0].name == "nga_12345.png"
+
+    # 若在设置中显式切换 Telegram 为 image_file 模式，则无论图片尺寸大小始终走 Comp.File 发送
+    plugin.config["telegram_options"] = {"delivery_mode": "image_file"}
     small_png = _make_png_bytes(780, 900)
     mocked.post(
         "http://mock-t2i.local:8999/text2img/generate",
@@ -281,7 +313,6 @@ async def test_plugin_end_to_end_aiocqhttp_and_telegram_tall_image(tmp_path: Pat
         body=small_png,
         headers={"Content-Type": "image/png"},
     )
-    # 清空队列使新注册的 small_png 生效
     mocked._queues[("POST", "http://mock-t2i.local:8999/text2img/generate")].popleft()
     tg_small_outputs = [r async for r in plugin.on_forum_link_message(ev_tg)]
     assert len(tg_small_outputs) == 1

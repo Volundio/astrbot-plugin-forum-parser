@@ -66,6 +66,7 @@ class BaseForumParser(ABC):
         link: ForumLink,
         *,
         embed_images: bool = True,
+        prefetch_data_uri: bool = True,
         max_inline_images: int = 15,
         enable_length_limit: bool = False,
         max_content_chars: int = 15000,

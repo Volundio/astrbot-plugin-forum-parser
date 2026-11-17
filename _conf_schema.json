@@ -152,6 +152,51 @@
       }
     }
   },
+  "telegram_options": {
+    "type": "object",
+    "description": "Telegram 发送设置",
+    "items": {
+      "delivery_mode": {
+        "type": "string",
+        "description": "Telegram 推送方式",
+        "default": "telegraph",
+        "options": [
+          "telegraph",
+          "image_file"
+        ],
+        "labels": [
+          "发布至 telegra.ph 即时预览（默认推荐）",
+          "发送自定义模板渲染长图文件 (Send as File)"
+        ],
+        "subtitles": [
+          "帖子配图自动上传至 p.sda1.dev 图床，生成原生清晰排版的 telegra.ph 链接触发 Instant View",
+          "调用远程 T2I 服务生成完整长图并以无损文件方式发送"
+        ]
+      },
+      "fallback_to_image": {
+        "type": "bool",
+        "description": "Telegraph 失败时自动用渲染长图兜底",
+        "hint": "开启后，若 telegra.ph 发布超时或不可用，自动回退为使用自定义 HTML 模板渲染长图并以文件形式发送。",
+        "default": true
+      },
+      "image_upload_url": {
+        "type": "string",
+        "description": "Telegraph 配图上传图床 API 地址",
+        "hint": "采用 POST Binary 流式上传，自动拼接 ?filename= 参数。",
+        "default": "https://p.sda1.dev/api/v1/upload_external_noform"
+      },
+      "max_upload_images": {
+        "type": "int",
+        "description": "单帖最多转存至图床的图片数量",
+        "default": 25,
+        "slider": {
+          "min": 1,
+          "max": 50,
+          "step": 1
+        }
+      }
+    }
+  },
   "onebot_options": {
     "type": "object",
     "description": "OneBot11 (QQ) 发送设置",

@@ -1007,6 +1007,7 @@ class NgaParser(BaseForumParser):
         link: ForumLink,
         *,
         embed_images: bool = True,
+        prefetch_data_uri: bool = True,
         max_inline_images: int = 15,
         enable_length_limit: bool = False,
         max_content_chars: int = 15000,
@@ -1117,6 +1118,7 @@ class NgaParser(BaseForumParser):
             cookies=cookies if has_auth else None,
             same_site_hosts=NGA_SAME_SITE_HOSTS,
             embed_images=embed_images,
+            prefetch_data_uri=prefetch_data_uri,
             max_inline_images=max_inline_images,
             enable_length_limit=enable_length_limit,
             max_content_chars=max_content_chars,
@@ -1124,7 +1126,7 @@ class NgaParser(BaseForumParser):
         )
 
         author_avatar = rewrite_legacy_media_url(extracted["author_avatar"])
-        if embed_images and author_avatar.startswith("http"):
+        if embed_images and prefetch_data_uri and author_avatar.startswith("http"):
             av_data = await _fetch_image_as_data_uri(
                 self.session,
                 author_avatar,

@@ -9,7 +9,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
 import aiohttp
 
@@ -392,17 +392,49 @@ def _is_safe_http_url(url: str) -> bool:
     return parsed.scheme.lower() in {"http", "https"} and bool(parsed.netloc)
 
 
+# 旧版已下线图床/附件域名自动迁移映射（NGA 178.com -> nga.cn，S1 saraba1st.com -> stage1st.com）
+LEGACY_MEDIA_HOST_MAP = {
+    "img.nga.178.com": "img.nga.cn",
+    "img4.nga.178.com": "img4.nga.cn",
+    "img8.nga.178.com": "img8.nga.cn",
+    "nga.178.com": "bbs.nga.cn",
+    "img.saraba1st.com": "img.stage1st.com",
+    "avatar.saraba1st.com": "avatar.stage1st.com",
+    "static.saraba1st.com": "static.stage1st.com",
+    "bbs.saraba1st.com": "stage1st.com",
+    "www.saraba1st.com": "stage1st.com",
+    "saraba1st.com": "stage1st.com",
+}
+
+
+def rewrite_legacy_media_url(url: str) -> str:
+    """将论坛历史遗留或已停解析的旧 CDN 域名自动重写为当前有效域名。"""
+    if not url or not url.startswith(("http://", "https://")):
+        return url
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return url
+    host = (parsed.hostname or "").lower()
+    new_host = LEGACY_MEDIA_HOST_MAP.get(host)
+    if not new_host:
+        return url
+    netloc = f"{new_host}:{parsed.port}" if parsed.port else new_host
+    scheme = "https" if parsed.scheme.lower() == "http" else parsed.scheme
+    return urlunparse((scheme, netloc, parsed.path, parsed.params, parsed.query, parsed.fragment))
+
+
 def _resolve_url(raw_url: str, base_url: str) -> str:
     u = (raw_url or "").strip()
     if not u:
         return ""
     if u.startswith("//"):
-        return "https:" + u
+        return rewrite_legacy_media_url("https:" + u)
     if u.startswith(("http://", "https://")):
-        return u
+        return rewrite_legacy_media_url(u)
     if u.startswith(("javascript:", "vbscript:", "data:", "file:", "mailto:")):
         return ""
-    return urljoin(base_url, u)
+    return rewrite_legacy_media_url(urljoin(base_url, u))
 
 
 def _is_smiley_image(node: MiniNode, resolved_src: str) -> bool:
@@ -937,22 +969,23 @@ async def prepare_post_images_for_forward(
     same_site_hosts: set[str] | None = None,
     max_single_bytes: int = MAX_FORWARD_SINGLE_IMAGE_BYTES,
     max_total_bytes: int = MAX_FORWARD_TOTAL_FILE_BYTES,
-) -> list[tuple[str, str]]:
-    """准备用于 OneBot11 合并转发的帖子原图列表（采用请求级临时文件流式落盘防 OOM，发送后由 TempScope 立即清空）。
+) -> tuple[list[str], int]:
+    """准备用于 OneBot11 合并转发的帖子原图本地文件列表（流式落盘防 OOM，发送后由 TempScope 立即清空）。
 
-    内存安全保护：
-    1. 不在内存中驻留多张图片的 Base64 副本，全部落盘为受 TempScope 托管的短生命周期临时文件；
-    2. 未内嵌图片采用 64KB 流式分块直写磁盘（单图上限 8MB）；
-    3. 严格控制单次合并消息的本地图片总字节预算（默认 15MB），超出预算的后续图片自动降级为 ("url", http_url)，
-       防止下游 OneBot 协议序列化整包 JSON 时引发内存溢出。
+    注意：AstrBot 底层 Node.to_dict() 对 Image.fromURL 仍会在无 Cookie/Referer 且无异常捕获的情况下发起下载，
+    一旦单张外链失效或超限会导致整条合并转发发送失败。因此此处仅返回已校验落盘成功的本地文件路径列表，
+    并统计未附带（超限或源站失效）的图片数量供上层展示纯文本提示，确保合并转发 100% 稳定发出。
 
     Returns:
-        list of ("file", local_file_path_str) or ("url", http_url_str)
+        (local_file_paths, skipped_images_count)
     """
-    if not post_image_urls or max_images <= 0:
-        return []
+    if not post_image_urls:
+        return [], 0
+    if max_images <= 0:
+        return [], len(post_image_urls)
 
     target_urls = post_image_urls[:max_images]
+    overflow_by_count = max(0, len(post_image_urls) - len(target_urls))
     idx_to_file: dict[int, Path] = {}
     used_file_bytes = 0
 
@@ -996,7 +1029,7 @@ async def prepare_post_images_for_forward(
                     eff_cap = min(max_single_bytes, remain_budget)
                     p, sz = await _stream_single_image_to_scope(
                         session,
-                        target_urls[idx],
+                        rewrite_legacy_media_url(target_urls[idx]),
                         scope,
                         referer=referer,
                         cookies=cookies,
@@ -1014,10 +1047,12 @@ async def prepare_post_images_for_forward(
                     else:
                         await asyncio.to_thread(p.unlink, True)
 
-    results: list[tuple[str, str]] = []
-    for idx, u in enumerate(target_urls):
+    local_files: list[str] = []
+    skipped_in_target = 0
+    for idx in range(len(target_urls)):
         if idx in idx_to_file:
-            results.append(("file", str(idx_to_file[idx])))
-        elif u.startswith(("http://", "https://")):
-            results.append(("url", u))
-    return results
+            local_files.append(str(idx_to_file[idx]))
+        else:
+            skipped_in_target += 1
+
+    return local_files, (overflow_by_count + skipped_in_target)

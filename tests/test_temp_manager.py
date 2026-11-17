@@ -232,24 +232,24 @@ async def test_oom_guards_stream_limit_and_forward_budget_and_concurrency(tmp_pa
     assert not dest.exists()
     assert not dest.with_suffix(".png.tmp").exists()
 
-    # 2. 合并转发原图达到 max_total_bytes 预算后，后续图片自动降级为 ("url", http_url) 零内存引用
+    # 2. 合并转发原图达到 max_total_bytes 预算或源站失效时，不塞入会导致 RespondStage 崩溃的裸 URL，而是统计跳过数
     mgr = TempFileManager(tmp_path / "fwd_quota", max_dir_bytes=1024 * 1024)
     scope = mgr.create_scope()
     img_payload = PNG_1X1 * 10  # ~670 bytes
     mocked.get(
-        "https://img.nga.178.com/attachments/1.png",
+        "https://img.nga.cn/attachments/1.png",
         status=200,
         body=img_payload,
         headers={"Content-Type": "image/png"},
     )
     mocked.get(
-        "https://img.nga.178.com/attachments/2.png",
+        "https://img.nga.cn/attachments/2.png",
         status=200,
         body=img_payload,
         headers={"Content-Type": "image/png"},
     )
     async with aiohttp.ClientSession(middlewares=[mocked.middleware]) as sess:
-        fwd_items = await prepare_post_images_for_forward(
+        local_files, skipped_cnt = await prepare_post_images_for_forward(
             "",
             [
                 "https://img.nga.178.com/attachments/1.png",
@@ -257,13 +257,13 @@ async def test_oom_guards_stream_limit_and_forward_budget_and_concurrency(tmp_pa
             ],
             scope,
             session=sess,
-            max_total_bytes=800,  # 仅够容纳第 1 张落盘，第 2 张必须自动退化为 URL
+            max_total_bytes=800,  # 仅够容纳第 1 张落盘，第 2 张安全跳过并计数
         )
-    assert len(fwd_items) == 2
-    assert fwd_items[0][0] == "file" and Path(fwd_items[0][1]).is_file()
-    assert fwd_items[1] == ("url", "https://img.nga.178.com/attachments/2.png")
+    assert len(local_files) == 1
+    assert skipped_cnt == 1
+    assert Path(local_files[0]).is_file()
     await scope.cleanup()
-    assert not Path(fwd_items[0][1]).exists()
+    assert not Path(local_files[0]).exists()
     assert not (tmp_path / "fwd_quota").exists()
 
     # 3. 全局并发信号量与排队背压保护

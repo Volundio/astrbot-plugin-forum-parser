@@ -188,13 +188,13 @@ async def test_plugin_end_to_end_aiocqhttp_and_telegram_tall_image(tmp_path: Pat
         body=nga_json.encode("utf-8"),
     )
     mocked.get(
-        "https://img.nga.178.com/attachments/mon_202611/17/p1.png",
+        "https://img.nga.cn/attachments/mon_202611/17/p1.png",
         status=200,
         body=tall_png,
         headers={"Content-Type": "image/png"},
     )
     mocked.get(
-        "https://img.nga.178.com/attachments/mon_202611/17/p2.png",
+        "https://img.nga.cn/attachments/mon_202611/17/p2.png",
         status=200,
         body=tall_png,
         headers={"Content-Type": "image/png"},
@@ -348,7 +348,7 @@ async def test_onebot_forward_fetches_post_images_even_when_embed_disabled_and_s
         body=s1_html.encode("utf-8"),
     )
     mocked.get(
-        "https://img.saraba1st.com/forum/202611/17/real_photo.png",
+        "https://img.stage1st.com/forum/202611/17/real_photo.png",
         status=200,
         body=png_bytes,
         headers={"Content-Type": "image/png"},

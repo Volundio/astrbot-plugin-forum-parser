@@ -145,14 +145,15 @@ async def test_s1_normal_thread_parse() -> None:
         body=SAMPLE_S1_NORMAL_HTML.encode("utf-8"),
         headers={"Content-Type": "text/html; charset=utf-8"},
     )
+    # 即使旧帖 HTML 中残留了 saraba1st.com 图床与头像地址，也会自动重写到 stage1st.com 请求
     mocked.get(
-        "https://img.saraba1st.com/forum/202611/17/pic1.png",
+        "https://img.stage1st.com/forum/202611/17/pic1.png",
         status=200,
         body=PNG_1X1,
         headers={"Content-Type": "image/png"},
     )
     mocked.get(
-        "https://avatar.saraba1st.com/test_avatar.jpg",
+        "https://avatar.stage1st.com/test_avatar.jpg",
         status=200,
         body=PNG_1X1,
         headers={"Content-Type": "image/png"},

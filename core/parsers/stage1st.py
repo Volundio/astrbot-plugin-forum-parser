@@ -12,6 +12,7 @@ from ..html_sanitizer import (
     _fetch_image_as_data_uri,
     parse_html,
     process_post_html,
+    rewrite_legacy_media_url,
 )
 from ..io_guard import read_response_bounded
 from ..models import (
@@ -31,23 +32,15 @@ S1_MOBILE_LOGIN_URL = (
     "https://stage1st.com/2b/api/mobile/index.php"
     "?version=4&module=login&loginsubmit=yes&loginfield=auto&cookietime=2592000"
 )
-# 参考 GreasyFork 419494 脚本：S1 官方 App 接口根路径（兼容新旧域名回退）
-S1_APP_API_BASES = (
-    "https://app.stage1st.com/2b/api/app",
-    "https://app.saraba1st.com/2b/api/app",
-)
+# 参考 GreasyFork 419494 脚本：S1 官方 App 接口根路径（旧域名 saraba1st.com 已下线）
+S1_APP_API_BASES = ("https://app.stage1st.com/2b/api/app",)
 
 S1_SAME_SITE_HOSTS = {
     "stage1st.com",
     "www.stage1st.com",
-    "bbs.saraba1st.com",
-    "saraba1st.com",
     "static.stage1st.com",
-    "static.saraba1st.com",
     "img.stage1st.com",
-    "img.saraba1st.com",
     "avatar.stage1st.com",
-    "avatar.saraba1st.com",
 }
 
 # 网页端不可见/受限提示关键字
@@ -86,7 +79,7 @@ def build_s1_avatar_url(uid: str | int | None) -> str:
         return ""
     padded = f"{int(s):09d}"
     path = f"{padded[0:3]}/{padded[3:5]}/{padded[5:7]}/{padded[7:9]}"
-    return f"https://avatar.saraba1st.com/{path}_avatar_middle.jpg"
+    return f"https://avatar.stage1st.com/{path}_avatar_middle.jpg"
 
 
 def format_timestamp_cn(ts: int | float | str | None) -> str:
@@ -779,6 +772,7 @@ class Stage1stParser(BaseForumParser):
         )
 
         # 预下载楼主头像为 Data URI 防止远端渲染器无法加载防盗链头像
+        author_avatar = rewrite_legacy_media_url(author_avatar)
         if embed_images and author_avatar.startswith("http"):
             av_data = await _fetch_image_as_data_uri(
                 self.session,

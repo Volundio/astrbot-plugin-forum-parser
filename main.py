@@ -367,7 +367,7 @@ class ForumParserPlugin(Star):
             else:
                 cookies, same_hosts = None, set()
 
-            post_imgs = await prepare_post_images_for_forward(
+            local_img_files, skipped_imgs = await prepare_post_images_for_forward(
                 parsed_thread.content_html,
                 parsed_thread.post_image_urls,
                 temp_scope,
@@ -377,25 +377,30 @@ class ForumParserPlugin(Star):
                 cookies=cookies,
                 same_site_hosts=same_hosts,
             )
-            total_imgs = len(post_imgs)
-            for idx, (kind, val) in enumerate(post_imgs, start=1):
-                if kind == "file":
-                    img_seg = (
-                        Comp.Image.fromFileSystem(val)
-                        if hasattr(Comp.Image, "fromFileSystem")
-                        else Comp.Image(file=val)
-                    )
-                else:
-                    img_seg = (
-                        Comp.Image.fromURL(val)
-                        if hasattr(Comp.Image, "fromURL")
-                        else Comp.Image(file=val)
-                    )
+            total_imgs = len(local_img_files)
+            for idx, file_path in enumerate(local_img_files, start=1):
+                img_seg = (
+                    Comp.Image.fromFileSystem(file_path)
+                    if hasattr(Comp.Image, "fromFileSystem")
+                    else Comp.Image(file=file_path)
+                )
                 nodes.append(
                     Comp.Node(
                         uin=bot_uin,
                         name=f"帖子配图 ({idx}/{total_imgs})",
                         content=[img_seg],
+                    )
+                )
+            if skipped_imgs > 0:
+                nodes.append(
+                    Comp.Node(
+                        uin=bot_uin,
+                        name=parsed_thread.forum.display_name,
+                        content=[
+                            Comp.Plain(
+                                f"ℹ️ 另有 {skipped_imgs} 张配图因体积超限或源站无法访问未附带，可点击原帖链接查看。"
+                            )
+                        ],
                     )
                 )
 

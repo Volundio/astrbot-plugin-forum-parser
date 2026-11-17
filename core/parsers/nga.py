@@ -10,7 +10,11 @@ from typing import Any
 
 import aiohttp
 
-from ..html_sanitizer import _fetch_image_as_data_uri, process_post_html
+from ..html_sanitizer import (
+    _fetch_image_as_data_uri,
+    process_post_html,
+    rewrite_legacy_media_url,
+)
 from ..io_guard import read_response_bounded
 from ..models import (
     ForumLink,
@@ -24,17 +28,17 @@ from .base import DEFAULT_BROWSER_UA, BaseForumParser, parse_cookie_string
 logger = logging.getLogger("astrbot")
 
 NGA_WEB_BASE = "https://bbs.nga.cn/"
-NGA_ATTACH_BASE = "https://img.nga.178.com/attachments"
+# NGA 官方已下线旧域名 img.nga.178.com，切换为新图床域名 img.nga.cn
+NGA_ATTACH_BASE = "https://img.nga.cn/attachments"
 NGA_APP_UA = "NGA_skull/6.0.5(iPhone10,3;iOS 12.0.1)"
 NGA_READ_UA = "NGA_WP_JW(;WINDOWS)"
 
 NGA_SAME_SITE_HOSTS = {
     "bbs.nga.cn",
     "ngabbs.com",
-    "nga.178.com",
-    "img.nga.178.com",
-    "img4.nga.178.com",
-    "img8.nga.178.com",
+    "img.nga.cn",
+    "img4.nga.cn",
+    "img8.nga.cn",
 }
 
 CHINA_TZ = timezone(timedelta(hours=8))
@@ -133,18 +137,19 @@ def _format_nga_time(val: Any) -> str:
     return s
 
 
-def _resolve_nga_img_src(raw_src: str) -> str:
+def _resolve_nga_img_src(raw_src: str, attach_base: str = NGA_ATTACH_BASE) -> str:
     s = (raw_src or "").strip()
     if not s:
         return ""
+    base = attach_base.rstrip("/")
     if s.startswith("./"):
-        return f"{NGA_ATTACH_BASE}/{s[2:].lstrip('/')}"
+        return rewrite_legacy_media_url(f"{base}/{s[2:].lstrip('/')}")
     if s.startswith("//"):
-        return "https:" + s
+        return rewrite_legacy_media_url("https:" + s)
     if s.startswith(("http://", "https://")):
-        return s
+        return rewrite_legacy_media_url(s)
     if s.startswith("mon_"):
-        return f"{NGA_ATTACH_BASE}/{s}"
+        return rewrite_legacy_media_url(f"{base}/{s}")
     return ""
 
 
@@ -686,6 +691,16 @@ class NgaParser(BaseForumParser):
             except (TypeError, ValueError):
                 pass
 
+        # 兼容动态 _ATTACH_BASE_VIEW（自动重写废弃的 178.com 域名至 img.nga.cn）
+        g_info = data.get("__GLOBAL") or {}
+        dyn_attach_base = str(g_info.get("_ATTACH_BASE_VIEW") or "").strip().strip("/")
+        if dyn_attach_base:
+            if not dyn_attach_base.startswith(("http://", "https://")):
+                dyn_attach_base = f"https://{dyn_attach_base}"
+            attach_base = rewrite_legacy_media_url(dyn_attach_base)
+        else:
+            attach_base = NGA_ATTACH_BASE
+
         # 提取附件映射（处理未通过 [img] 插入正文的底部图片附件）
         attach_map: dict[str, str] = {}
         orphan_img_urls: list[str] = []
@@ -701,7 +716,7 @@ class NgaParser(BaseForumParser):
             att_url_rel = str(att.get("attachurl") or "").strip()
             if not att_url_rel:
                 continue
-            full_u = _resolve_nga_img_src("./" + att_url_rel.lstrip("/"))
+            full_u = _resolve_nga_img_src("./" + att_url_rel.lstrip("/"), attach_base=attach_base)
             if not full_u:
                 continue
             aid = str(att.get("aid") or att.get("name") or "")
@@ -861,7 +876,7 @@ class NgaParser(BaseForumParser):
             out_post_image_urls=post_image_urls,
         )
 
-        author_avatar = extracted["author_avatar"]
+        author_avatar = rewrite_legacy_media_url(extracted["author_avatar"])
         if embed_images and author_avatar.startswith("http"):
             av_data = await _fetch_image_as_data_uri(
                 self.session,

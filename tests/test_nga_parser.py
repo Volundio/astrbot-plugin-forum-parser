@@ -35,9 +35,9 @@ def test_nga_bbcode_conversion_and_xss_escape() -> None:
     # 折叠块自动展开
     assert "折叠内容（已自动展开）：点击查看详细伤害数据" in html_out
     assert "折叠内隐藏文本123" in html_out
-    # 相对附件图片路径被补全为 NGA 官方图床地址
-    assert "https://img.nga.178.com/attachments/mon_202611/17/chart.png" in html_out
-    assert "https://img.nga.178.com/attachments/mon_202611/17/chart.png" in used_imgs
+    # 相对附件图片路径被补全为 NGA 当前有效图床地址 img.nga.cn
+    assert "https://img.nga.cn/attachments/mon_202611/17/chart.png" in html_out
+    assert "https://img.nga.cn/attachments/mon_202611/17/chart.png" in used_imgs
     # 列表与表格
     assert '<ul class="forum-list"><li>条目A</li><li>条目B</li></ul>' in html_out
     assert '<td width="25%">列1</td><td colspan="2">列2</td>' in html_out
@@ -75,13 +75,14 @@ async def test_nga_read_php_json_parse_with_raw_tab_and_orphan_attach() -> None:
         body=raw_nga_json.encode("utf-8"),
     )
     mocked.get(
-        "https://img.nga.178.com/attachments/mon_202611/17/extra_att.png",
+        "https://img.nga.cn/attachments/mon_202611/17/extra_att.png",
         status=200,
         body=PNG_1X1,
         headers={"Content-Type": "image/png"},
     )
+    # 即使原 JSON 返回了旧版 img.nga.178.com 头像域名，也会被自动迁移请求至 img.nga.cn
     mocked.get(
-        "https://img.nga.178.com/avatars/u1.png",
+        "https://img.nga.cn/avatars/u1.png",
         status=200,
         body=PNG_1X1,
         headers={"Content-Type": "image/png"},

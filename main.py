@@ -24,7 +24,7 @@ if __package__:
         ParsedThread,
         RenderResult,
     )
-    from .core.parsers import NgaParser, Stage1stParser
+    from .core.parsers import BangumiParser, NgaParser, Stage1stParser
     from .core.renderer import ForumCardRenderer
     from .core.telegraph_publisher import DEFAULT_SDA1_UPLOAD_URL, TelegraphPublisher
     from .core.temp_manager import BoundedTTLCache, TempFileManager, TempScope
@@ -44,7 +44,7 @@ else:
         ParsedThread,
         RenderResult,
     )
-    from core.parsers import NgaParser, Stage1stParser
+    from core.parsers import BangumiParser, NgaParser, Stage1stParser
     from core.renderer import ForumCardRenderer
     from core.telegraph_publisher import DEFAULT_SDA1_UPLOAD_URL, TelegraphPublisher
     from core.temp_manager import BoundedTTLCache, TempFileManager, TempScope
@@ -69,7 +69,18 @@ def _is_manual_cmd_text(message_str: str) -> bool:
 
 
 def _estimate_parsed_thread_bytes(t: ParsedThread) -> int:
-    return len(t.content_html) + len(t.author_avatar) + len(t.title) + 512
+    return len(t.content_html) + len(t.author_avatar) + len(t.group_icon) + len(t.title) + 512
+
+
+def _get_event_platform(event: Any) -> str:
+    """安全提取消息事件所属平台适配器标识（小写）。"""
+    get_pf = getattr(event, "get_platform_name", None)
+    if callable(get_pf):
+        try:
+            return str(get_pf() or "").strip().lower()
+        except Exception:
+            return ""
+    return ""
 
 
 def _read_json_file(path: Path) -> dict[str, Any]:
@@ -108,7 +119,7 @@ def _write_or_prune_json_file(path: Path, key: str, value: Any) -> None:
 
 
 class ForumAutoLinkFilter(filter.CustomFilter):
-    """快速预筛包含 Stage1st 或 NGA 链接的消息，避免无关闲聊唤醒消息管线。"""
+    """快速预筛包含 Stage1st、NGA 或 OneBot 端 Bangumi 链接的消息，避免无关闲聊唤醒消息管线。"""
 
     def filter(self, event: AstrMessageEvent, cfg: AstrBotConfig) -> bool:
         try:
@@ -120,12 +131,19 @@ class ForumAutoLinkFilter(filter.CustomFilter):
             if _is_manual_cmd_text(event.message_str or ""):
                 return False
 
+            platform_name = _get_event_platform(event)
+            # Bangumi 解析严格限定仅在 QQ OneBot (aiocqhttp) 平台生效，Telegram 等其他平台不触发
+            enable_bgm = platform_name == "aiocqhttp"
+            if enable_bgm and isinstance(cfg, dict) and isinstance(cfg.get("bangumi"), dict):
+                enable_bgm = bool(cfg["bangumi"].get("enabled", True))
+
             links = extract_forum_links_from_event(
                 event,
                 allow_alias_domains=True,
                 parse_share_cards=True,
                 enable_s1=True,
                 enable_nga=True,
+                enable_bangumi=enable_bgm,
             )
             return len(links) > 0
         except Exception:
@@ -167,6 +185,7 @@ class ForumParserPlugin(Star):
         self._http_session: aiohttp.ClientSession | None = None
         self._s1_parser: Stage1stParser | None = None
         self._nga_parser: NgaParser | None = None
+        self._bgm_parser: BangumiParser | None = None
         self._renderer: ForumCardRenderer | None = None
         self._telegraph_publisher: TelegraphPublisher | None = None
         self._gc_task: asyncio.Task[None] | None = None
@@ -226,40 +245,56 @@ class ForumParserPlugin(Star):
                 enable_cleanup_closed=True,
             )
             self._http_session = aiohttp.ClientSession(trust_env=True, connector=connector)
+            self._s1_parser = None
+            self._nga_parser = None
+            self._bgm_parser = None
+            self._renderer = None
+            self._telegraph_publisher = None
+
+        if self._s1_parser is None:
             self._s1_parser = Stage1stParser(
                 self._http_session,
                 config=self._get_sub_cfg("stage1st"),
                 kv_getter=self._kv_get,
                 kv_setter=self._kv_set,
             )
+        else:
+            self._s1_parser.update_config(self._get_sub_cfg("stage1st"))
+
+        if self._nga_parser is None:
             self._nga_parser = NgaParser(
                 self._http_session,
                 config=self._get_sub_cfg("nga"),
                 kv_getter=self._kv_get,
                 kv_setter=self._kv_set,
             )
+        else:
+            self._nga_parser.update_config(self._get_sub_cfg("nga"))
+
+        if self._bgm_parser is None:
+            self._bgm_parser = BangumiParser(
+                self._http_session,
+                config=self._get_sub_cfg("bangumi"),
+                kv_getter=self._kv_get,
+                kv_setter=self._kv_set,
+            )
+        else:
+            self._bgm_parser.update_config(self._get_sub_cfg("bangumi"))
+
+        if self._renderer is None:
             self._renderer = ForumCardRenderer(
                 context=self.context,
                 session=self._http_session,
                 temp_dir=self._temp_dir,
                 temp_manager=self._temp_mgr,
             )
+
+        if self._telegraph_publisher is None:
             self._telegraph_publisher = TelegraphPublisher(
                 self._http_session,
                 kv_getter=self._kv_get,
                 kv_setter=self._kv_set,
             )
-        else:
-            if self._s1_parser is not None:
-                self._s1_parser.update_config(self._get_sub_cfg("stage1st"))
-            if self._nga_parser is not None:
-                self._nga_parser.update_config(self._get_sub_cfg("nga"))
-            if self._telegraph_publisher is None:
-                self._telegraph_publisher = TelegraphPublisher(
-                    self._http_session,
-                    kv_getter=self._kv_get,
-                    kv_setter=self._kv_set,
-                )
 
         if self._gc_task is None or self._gc_task.done():
             with contextlib.suppress(RuntimeError):
@@ -350,7 +385,14 @@ class ForumParserPlugin(Star):
             if parsed_thread.category
             else parsed_thread.title
         )
-        if parsed_thread.is_main_post:
+        if (
+            parsed_thread.forum == ForumType.BANGUMI
+            and parsed_thread.sub_type == "blog"
+            and parsed_thread.is_main_post
+        ):
+            author_part = f"作者：{parsed_thread.author}"
+            card_node_name = f"{parsed_thread.author} · 日志长评"
+        elif parsed_thread.is_main_post:
             author_part = f"楼主：{parsed_thread.author}"
             card_node_name = f"{parsed_thread.author} · 主楼长图"
         else:
@@ -388,6 +430,8 @@ class ForumParserPlugin(Star):
         if include_post_imgs and parsed_thread.post_image_urls and max_forward_imgs > 0:
             if parsed_thread.forum == ForumType.STAGE1ST and self._s1_parser is not None:
                 cookies, same_hosts = await self._s1_parser.get_media_auth_context()
+            elif parsed_thread.forum == ForumType.BANGUMI and self._bgm_parser is not None:
+                cookies, same_hosts = self._bgm_parser.get_media_auth_context()
             elif self._nga_parser is not None:
                 cookies, same_hosts = self._nga_parser.get_media_auth_context()
             else:
@@ -402,6 +446,7 @@ class ForumParserPlugin(Star):
                 referer=parsed_thread.url,
                 cookies=cookies,
                 same_site_hosts=same_hosts,
+                pre_downloaded_files=parsed_thread.pre_downloaded_files,
             )
             total_imgs = len(local_img_files)
             for idx, file_path in enumerate(local_img_files, start=1):
@@ -444,13 +489,14 @@ class ForumParserPlugin(Star):
         self._ensure_services()
         assert self._s1_parser is not None
         assert self._nga_parser is not None
+        assert self._bgm_parser is not None
         assert self._renderer is not None
         assert self._telegraph_publisher is not None
 
         async with self._task_limiter.acquire():
-            platform_name = ""
-            if hasattr(event, "get_platform_name") and callable(event.get_platform_name):
-                platform_name = str(event.get_platform_name() or "").lower()
+            platform_name = _get_event_platform(event)
+            if link.forum == ForumType.BANGUMI and platform_name != "aiocqhttp":
+                raise ForumParseError("Bangumi 帖子/日志解析仅限 QQ OneBot 平台启用。")
 
             render_opts = self._get_sub_cfg("render_options")
             embed_images = bool(render_opts.get("embed_images", True))
@@ -465,7 +511,12 @@ class ForumParserPlugin(Star):
             tg_upload_url = str(tg_opts.get("image_upload_url") or DEFAULT_SDA1_UPLOAD_URL).strip()
             tg_fallback_to_image = bool(tg_opts.get("fallback_to_image", True))
 
-            parser = self._s1_parser if link.forum == ForumType.STAGE1ST else self._nga_parser
+            if link.forum == ForumType.STAGE1ST:
+                parser = self._s1_parser
+            elif link.forum == ForumType.BANGUMI:
+                parser = self._bgm_parser
+            else:
+                parser = self._nga_parser
 
             # 1. Telegram 默认优先走 telegra.ph 即时预览发布（跳过 Base64 内存预加载，配图流式上传至 p.sda1.dev）
             if use_telegraph:
@@ -497,6 +548,8 @@ class ForumParserPlugin(Star):
                 try:
                     if tg_thread.forum == ForumType.STAGE1ST:
                         cookies, same_hosts = await self._s1_parser.get_media_auth_context()
+                    elif tg_thread.forum == ForumType.BANGUMI:
+                        cookies, same_hosts = self._bgm_parser.get_media_auth_context()
                     else:
                         cookies, same_hosts = self._nga_parser.get_media_auth_context()
 
@@ -512,6 +565,7 @@ class ForumParserPlugin(Star):
                     if not tg_from_cache:
                         tg_thread.content_html = ""
                         tg_thread.author_avatar = ""
+                        tg_thread.group_icon = ""
                     await temp_scope.cleanup()
                     # 按约定仅发送纯粹的 telegra.ph 链接，不附带额外文字，直接触发 Telegram 原生 Instant View
                     return event.plain_result(telegraph_url)
@@ -538,6 +592,17 @@ class ForumParserPlugin(Star):
             if parsed_thread is not None:
                 from_cache = True
             else:
+
+                async def _rehost_oversize(local_path: Path, filename: str) -> str | None:
+                    if self._telegraph_publisher is None:
+                        return None
+                    hosted = await self._telegraph_publisher._upload_file_to_sda1(
+                        local_path, filename, upload_url=tg_upload_url
+                    )
+                    if hosted:
+                        await self._telegraph_publisher._warm_single_image_url(hosted)
+                    return hosted
+
                 parsed_thread = await parser.parse_thread(
                     link,
                     embed_images=embed_images,
@@ -545,9 +610,16 @@ class ForumParserPlugin(Star):
                     max_inline_images=max_inline_images,
                     enable_length_limit=enable_length_limit,
                     max_content_chars=max_content_chars,
+                    temp_scope=temp_scope,
+                    rehost_oversize_fn=_rehost_oversize,
                 )
-                self._parse_cache.set(cache_key, parsed_thread)
-                from_cache = self._parse_cache.get(cache_key) is parsed_thread
+                # 含内联失败图片或本请求作用域临时文件路径的结果不进入内存缓存，防止坏图缓存污染与跨请求路径失效
+                if (
+                    not parsed_thread.has_uninlined_images
+                    and not parsed_thread.pre_downloaded_files
+                ):
+                    self._parse_cache.set(cache_key, parsed_thread)
+                    from_cache = self._parse_cache.get(cache_key) is parsed_thread
 
             plugin_t2i_ep = str(self.config.get("t2i_endpoint") or "").strip()
             umo = getattr(event, "unified_msg_origin", None)
@@ -586,13 +658,17 @@ class ForumParserPlugin(Star):
                 else:
                     msg_result = event.image_result(render_res.image_path)
 
+                parsed_thread.pre_downloaded_files.clear()
+
                 # 若该帖子包含内嵌大图而未进入轻量缓存，组装完毕后立即释放大字符串引用以降低发送期内存占用
                 if not from_cache:
                     parsed_thread.content_html = ""
                     parsed_thread.author_avatar = ""
+                    parsed_thread.group_icon = ""
 
                 return msg_result
             except BaseException:
+                parsed_thread.pre_downloaded_files.clear()
                 await temp_scope.cleanup()
                 raise
 
@@ -601,10 +677,14 @@ class ForumParserPlugin(Star):
         filter.PlatformAdapterType.AIOCQHTTP | filter.PlatformAdapterType.TELEGRAM
     )
     async def cmd_parse_forum(self, event: AstrMessageEvent, url: str = ""):
-        """手动解析指定的 Stage1st 或 NGA 论坛帖子链接并渲染为图片。"""
+        """手动解析指定的 Stage1st、NGA 或 Bangumi (QQ OneBot) 链接并渲染为图片。"""
         s1_cfg = self._get_sub_cfg("stage1st")
         nga_cfg = self._get_sub_cfg("nga")
+        bgm_cfg = self._get_sub_cfg("bangumi")
         parse_opts = self._get_sub_cfg("parse_options")
+
+        platform_name = _get_event_platform(event)
+        enable_bgm = bool(bgm_cfg.get("enabled", True)) and (platform_name == "aiocqhttp")
 
         links: list[ForumLink] = []
         if url:
@@ -613,6 +693,7 @@ class ForumParserPlugin(Star):
                 allow_alias_domains=bool(parse_opts.get("allow_alias_domains", True)),
                 enable_s1=bool(s1_cfg.get("enabled", True)),
                 enable_nga=bool(nga_cfg.get("enabled", True)),
+                enable_bangumi=enable_bgm,
             )
             if single:
                 links.append(single)
@@ -624,11 +705,12 @@ class ForumParserPlugin(Star):
                 parse_share_cards=True,
                 enable_s1=bool(s1_cfg.get("enabled", True)),
                 enable_nga=bool(nga_cfg.get("enabled", True)),
+                enable_bangumi=enable_bgm,
             )
 
         if not links:
             yield event.plain_result(
-                "未识别到受支持的论坛帖子链接，请提供有效的 Stage1st 或 NGA 帖子地址。"
+                "未识别到受支持的论坛帖子链接，请提供有效的 Stage1st、NGA 或 Bangumi (仅 QQ 平台) 帖子地址。"
             )
             return
 
@@ -654,14 +736,17 @@ class ForumParserPlugin(Star):
     )
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def on_forum_link_message(self, event: AstrMessageEvent):
-        """自动监听聊天中的 Stage1st 与 NGA 帖子链接并渲染主楼图片发送。"""
+        """自动监听聊天中的 Stage1st、NGA 与 QQ 端 Bangumi 链接并渲染主楼图片发送。"""
         s1_cfg = self._get_sub_cfg("stage1st")
         nga_cfg = self._get_sub_cfg("nga")
+        bgm_cfg = self._get_sub_cfg("bangumi")
         parse_opts = self._get_sub_cfg("parse_options")
 
+        platform_name = _get_event_platform(event)
         enable_s1 = bool(s1_cfg.get("enabled", True))
         enable_nga = bool(nga_cfg.get("enabled", True))
-        if not enable_s1 and not enable_nga:
+        enable_bgm = bool(bgm_cfg.get("enabled", True)) and (platform_name == "aiocqhttp")
+        if not enable_s1 and not enable_nga and not enable_bgm:
             return
 
         links = extract_forum_links_from_event(
@@ -670,6 +755,7 @@ class ForumParserPlugin(Star):
             parse_share_cards=bool(parse_opts.get("parse_share_cards", True)),
             enable_s1=enable_s1,
             enable_nga=enable_nga,
+            enable_bangumi=enable_bgm,
         )
         if not links:
             return

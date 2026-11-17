@@ -6,9 +6,10 @@
 
 ## 功能特性
 
-- **双论坛深度支持（主楼 + 指定楼层精准解析）**
+- **多论坛深度支持（主楼 + 指定楼层精准解析）**
   - **Stage1st (`https://stage1st.com/2b/`)**：兼容 `saraba1st.com` 等官方同源域名；支持解析主楼与带楼层 ID 的链接（如 `forum.php?mod=redirect&goto=findpost&ptid=...&pid=...`、`thread-...html#pid...`，自动渲染对应楼层而非主楼）；支持直接配置**账号 + 密码（及可选安全提问）**自动维护网页登录态；参考社区脚本实现**官方 App 接口不可见内容解锁**（自动获取主楼及指定楼层的“内容审核中”与“作者被禁止或删除 内容自动屏蔽”原文，并在 `sid` 过期时自动重登刷新）；自动过滤 Discuz 防复制干扰码并展开反白剧透文字与评分记录。
   - **NGA 玩家社区 (`https://bbs.nga.cn/`)**：兼容 `ngabbs.com`、`nga.178.com`、`g.nga.cn` 等同源域名；支持解析主楼与带 `pid` / `#l楼层` 的单回复链接（如 `read.php?pid=...`、`read.php?tid=...&pid=...`、`read.php?tid=...&page=2#l25`）；支持配置 `ngaPassportUid` + `ngaPassportCid` 或完整 Cookie 字符串；采用 `read.php?__output=11` 与移动端 `app_api.php` 双通道容灾解析；内置完整的 NGA BBCode 转语义化 HTML 引擎（自动展开 `[collapse]` 折叠块、转换引用、表格、列表、删除线、AC娘表情标签及未显式插入正文的尾部图片附件）。
+  - **Bangumi 番组计划 (`bangumi.tv` / `bgm.tv` / `chii.in`，仅限 QQ OneBot 平台)**：支持小组话题（`/group/topic/...`、`/rakuen/topic/group/...`）、条目讨论（`/subject/topic/...`）与日志长评（`/blog/...`）及 `#post_...` 楼层/楼中楼锚点；内置 Bangumi 专属樱花粉渲染模板，展示小组图标、预估阅读时长、`[mask]` 剧透展开、贴贴表情计数与关联作品条目卡片；对 Telegram 平台收到的 Bangumi 链接自动忽略不解析。
 - **多平台与富媒体链接提取**
   - 支持 **OneBot v11 (`aiocqhttp`)** 与 **Telegram (`telegram`)** 平台。
   - **OneBot v11 默认合并转发**：在 QQ 平台默认以合并转发消息形式发送（包含帖子标题与原帖链接、主楼完整渲染长图，以及帖子主楼内的所有配图/GIF 原图节点，可在设置中调整）。
@@ -51,6 +52,7 @@ git clone https://github.com/Volundio/astrbot-plugin-forum-parser.git astrbot_pl
 | `onebot_options` | `use_forward` / `forward_include_images` / `forward_max_images` | 控制 QQ (OneBot11) 默认合并转发开关、是否在合并转发中一并附带帖子原图及原图数量上限。 |
 | `stage1st` | `username` / `password` / `question_id` / `answer` / `enable_invisible_parse` | 配置 S1 账号密码（可选安全提问、Cookie 或 `app_sid` 兜底），开启后自动解锁审核中与禁言屏蔽内容。 |
 | `nga` | `passport_uid` / `passport_cid` / `cookie` | 配置浏览器登录 NGA 后的 `ngaPassportUid` 与 `ngaPassportCid`（或完整 Cookie 字符串）。 |
+| `bangumi` | `enabled` / `cookie` | 控制 Bangumi 解析开关及可选网页 Cookie（仅在 QQ OneBot 平台生效，Telegram 平台不解析）。 |
 
 ## 使用方法
 

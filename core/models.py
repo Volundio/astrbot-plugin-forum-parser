@@ -9,6 +9,7 @@ class ForumType(StrEnum):
 
     STAGE1ST = "stage1st"
     NGA = "nga"
+    BANGUMI = "bangumi"
 
     @property
     def display_name(self) -> str:
@@ -16,6 +17,8 @@ class ForumType(StrEnum):
             return "Stage1st"
         if self == ForumType.NGA:
             return "NGA 玩家社区"
+        if self == ForumType.BANGUMI:
+            return "Bangumi 番组计划"
         return self.value
 
 
@@ -30,6 +33,7 @@ class ForumLink:
     pid: str = ""
     page: int = 1
     floor_hint: int = 0
+    sub_type: str = ""
 
     @property
     def is_floor_link(self) -> bool:
@@ -40,10 +44,12 @@ class ForumLink:
     def target_id(self) -> str:
         """用于去重、冷却与缓存的唯一目标标识（区分同帖主楼与不同回复楼层）。"""
         if self.pid:
-            return f"{self.tid}:pid:{self.pid}" if self.tid else f"pid:{self.pid}"
-        if self.floor_hint > 0:
-            return f"{self.tid}:floor:{self.floor_hint}"
-        return self.tid
+            base = f"{self.tid}:pid:{self.pid}" if self.tid else f"pid:{self.pid}"
+        elif self.floor_hint > 0:
+            base = f"{self.tid}:floor:{self.floor_hint}"
+        else:
+            base = self.tid
+        return f"{self.sub_type}:{base}" if self.sub_type else base
 
 
 @dataclass
@@ -53,6 +59,25 @@ class RateItem:
     user: str
     score: str
     reason: str = ""
+
+
+@dataclass
+class ReactionItem:
+    """贴贴表态条目（如 Bangumi 贴贴表情计数）。"""
+
+    emoji_url: str = ""
+    label: str = ""
+    count: int = 0
+
+
+@dataclass
+class RelatedSubject:
+    """关联作品条目（用于 Bangumi 日志/条目讨论展示）。"""
+
+    subject_id: str
+    title: str
+    subtitle: str = ""
+    cover: str = ""
 
 
 @dataclass
@@ -87,6 +112,14 @@ class ParsedThread:
     rate_summary: str = ""
     rates: list[RateItem] = field(default_factory=list)
     post_image_urls: list[str] = field(default_factory=list)
+    sub_type: str = ""
+    group_icon: str = ""
+    author_sign: str = ""
+    reading_time: str = ""
+    reactions: list[ReactionItem] = field(default_factory=list)
+    related_subjects: list[RelatedSubject] = field(default_factory=list)
+    pre_downloaded_files: dict[int, str] = field(default_factory=dict)
+    has_uninlined_images: bool = False
 
     @property
     def display_floor_badge(self) -> str:

@@ -4,7 +4,9 @@ import html
 import json
 import re
 import time
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -23,6 +25,7 @@ from ..models import (
     ForumType,
     ParsedThread,
 )
+from ..temp_manager import TempScope
 from .base import DEFAULT_BROWSER_UA, BaseForumParser, parse_cookie_string
 
 NGA_WEB_BASE = "https://bbs.nga.cn/"
@@ -1008,6 +1011,8 @@ class NgaParser(BaseForumParser):
         max_inline_images: int = 15,
         enable_length_limit: bool = False,
         max_content_chars: int = 15000,
+        temp_scope: TempScope | None = None,
+        rehost_oversize_fn: Callable[[Path, str], Awaitable[str | None]] | None = None,
     ) -> ParsedThread:
         tid = link.tid
         target_pid = link.pid
@@ -1107,6 +1112,8 @@ class NgaParser(BaseForumParser):
             bb_html += '<div class="forum-attachments">' + "".join(extra_imgs) + "</div>"
 
         post_image_urls: list[str] = []
+        pre_downloaded_files: dict[int, str] = {}
+        uninlined_flags: list[bool] = []
         clean_html, is_truncated, char_count, omitted_imgs = await process_post_html(
             bb_html,
             base_url=NGA_WEB_BASE,
@@ -1120,6 +1127,10 @@ class NgaParser(BaseForumParser):
             enable_length_limit=enable_length_limit,
             max_content_chars=max_content_chars,
             out_post_image_urls=post_image_urls,
+            temp_scope=temp_scope,
+            rehost_oversize_fn=rehost_oversize_fn,
+            out_downloaded_files=pre_downloaded_files,
+            out_has_uninlined_images=uninlined_flags,
         )
 
         author_avatar = rewrite_legacy_media_url(extracted["author_avatar"])
@@ -1157,6 +1168,8 @@ class NgaParser(BaseForumParser):
             truncated_at_chars=char_count if is_truncated else 0,
             omitted_images_count=omitted_imgs,
             post_image_urls=post_image_urls,
+            pre_downloaded_files=pre_downloaded_files,
+            has_uninlined_images=bool(uninlined_flags),
         )
 
     def get_media_auth_context(self) -> tuple[dict[str, str] | None, set[str]]:

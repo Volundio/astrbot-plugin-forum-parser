@@ -16,6 +16,7 @@ from .models import ForumType, ParsedThread, RenderResult
 from .temp_manager import TempFileManager, TempScope
 
 TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "forum_card.html"
+BANGUMI_TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "bangumi_card.html"
 DEFAULT_ASTRBOT_T2I_ENDPOINT = "https://t2i.soulter.top/text2img"
 
 SCALE_FACTOR_VALUES = {
@@ -27,6 +28,10 @@ SCALE_FACTOR_VALUES = {
 
 def load_forum_card_template() -> str:
     return TEMPLATE_PATH.read_text(encoding="utf-8")
+
+
+def load_bangumi_card_template() -> str:
+    return BANGUMI_TEMPLATE_PATH.read_text(encoding="utf-8")
 
 
 def _inspect_file_meta(file_path: str) -> tuple[int, int, str, int]:
@@ -121,11 +126,21 @@ def build_template_payload(
     opts = render_options or {}
     theme_setting = str(opts.get("theme") or "auto").lower()
     if theme_setting == "auto":
-        theme_key = "s1" if thread.forum == ForumType.STAGE1ST else "nga"
-    elif theme_setting in {"light", "dark", "s1", "nga"}:
+        if thread.forum == ForumType.STAGE1ST:
+            theme_key = "s1"
+        elif thread.forum == ForumType.BANGUMI:
+            theme_key = "bgm"
+        else:
+            theme_key = "nga"
+    elif theme_setting in {"light", "dark", "s1", "nga", "bgm"}:
         theme_key = theme_setting
     else:
-        theme_key = "s1" if thread.forum == ForumType.STAGE1ST else "nga"
+        if thread.forum == ForumType.STAGE1ST:
+            theme_key = "s1"
+        elif thread.forum == ForumType.BANGUMI:
+            theme_key = "bgm"
+        else:
+            theme_key = "nga"
 
     viewport_width = int(opts.get("viewport_width") or 780)
     viewport_width = max(480, min(1400, viewport_width))
@@ -154,13 +169,30 @@ def build_template_payload(
     author_clean = (thread.author or "?").strip()
     author_initial = author_clean[0].upper() if author_clean else "?"
 
-    forum_badge = "Stage1st · S1" if thread.forum == ForumType.STAGE1ST else "NGA · 玩家社区"
+    if thread.forum == ForumType.STAGE1ST:
+        forum_badge = "Stage1st · S1"
+    elif thread.forum == ForumType.BANGUMI:
+        forum_badge = "Bangumi 番组计划"
+    else:
+        forum_badge = "NGA · 玩家社区"
+
+    if thread.sub_type == "blog":
+        sub_type_badge = "日志 · 长评"
+    elif thread.sub_type == "subject_topic":
+        sub_type_badge = "条目讨论"
+    elif thread.sub_type == "group_topic":
+        sub_type_badge = "小组话题"
+    else:
+        sub_type_badge = ""
 
     tmpl_data: dict[str, Any] = {
         "theme_key": theme_key,
         "viewport_width": viewport_width,
         "forum_badge": forum_badge,
         "forum_name": thread.forum_name,
+        "sub_type": thread.sub_type,
+        "sub_type_badge": sub_type_badge,
+        "group_icon": thread.group_icon,
         "tid": thread.tid,
         "pid": thread.pid,
         "is_main_post": thread.is_main_post,
@@ -173,6 +205,8 @@ def build_template_payload(
         "author_id": thread.author_id,
         "author_avatar": thread.author_avatar,
         "author_group": thread.author_group,
+        "author_sign": thread.author_sign,
+        "reading_time": thread.reading_time,
         "created_at": thread.created_at,
         "views": thread.views,
         "replies": thread.replies,
@@ -186,6 +220,19 @@ def build_template_payload(
         "omitted_images_count": thread.omitted_images_count,
         "rate_summary": thread.rate_summary,
         "rates": [{"user": r.user, "score": r.score, "reason": r.reason} for r in thread.rates],
+        "reactions": [
+            {"emoji_url": rx.emoji_url, "label": rx.label, "count": rx.count}
+            for rx in thread.reactions
+        ],
+        "related_subjects": [
+            {
+                "subject_id": rs.subject_id,
+                "title": rs.title,
+                "subtitle": rs.subtitle,
+                "cover": rs.cover,
+            }
+            for rs in thread.related_subjects
+        ],
     }
 
     screenshot_options: dict[str, Any] = {
@@ -219,6 +266,7 @@ class ForumCardRenderer:
         self.temp_dir = temp_dir or (Path(tempfile.gettempdir()) / "astrbot_forum_parser")
         self.temp_manager = temp_manager
         self._tmpl_str = load_forum_card_template()
+        self._bgm_tmpl_str = load_bangumi_card_template()
 
     def _resolve_effective_endpoint(
         self, plugin_t2i_endpoint: str = "", umo: str | None = None
@@ -246,6 +294,7 @@ class ForumCardRenderer:
         tmpl_data: dict[str, Any],
         options: dict[str, Any],
         *,
+        tmpl_str: str | None = None,
         temp_scope: TempScope | None = None,
     ) -> str:
         """直接调用 astrbot-t2i-service 的 POST /text2img/generate 接口并按块流式保存为本地临时图片。
@@ -255,7 +304,7 @@ class ForumCardRenderer:
         base_ep = normalize_t2i_endpoint(endpoint) or DEFAULT_ASTRBOT_T2I_ENDPOINT
         gen_url = f"{base_ep}/generate"
         payload = {
-            "tmpl": self._tmpl_str,
+            "tmpl": tmpl_str or self._tmpl_str,
             "json": False,
             "tmpldata": tmpl_data,
             "options": options,
@@ -294,6 +343,7 @@ class ForumCardRenderer:
     ) -> RenderResult:
         """将 ParsedThread 渲染为本地图片文件并返回 RenderResult。"""
         tmpl_data, options = build_template_payload(thread, render_options)
+        selected_tmpl = self._bgm_tmpl_str if thread.forum == ForumType.BANGUMI else self._tmpl_str
         effective_endpoint = self._resolve_effective_endpoint(plugin_t2i_endpoint, umo=umo)
 
         img_path: str | None = None
@@ -306,7 +356,7 @@ class ForumCardRenderer:
 
             if supports_endpoint_kw:
                 img_path = await render_fn(
-                    self._tmpl_str,
+                    selected_tmpl,
                     tmpl_data,
                     return_url=False,
                     options=options,
@@ -315,7 +365,7 @@ class ForumCardRenderer:
             elif not effective_endpoint:
                 # 未单独覆盖 endpoint 时，直接走旧版 AstrBot 内置 html_renderer
                 img_path = await render_fn(
-                    self._tmpl_str,
+                    selected_tmpl,
                     tmpl_data,
                     return_url=False,
                     options=options,
@@ -327,6 +377,7 @@ class ForumCardRenderer:
                 effective_endpoint or DEFAULT_ASTRBOT_T2I_ENDPOINT,
                 tmpl_data,
                 options,
+                tmpl_str=selected_tmpl,
                 temp_scope=temp_scope,
             )
 

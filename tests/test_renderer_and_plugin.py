@@ -477,3 +477,158 @@ def test_astrbot_market_compliance_no_stdlib_logging_in_runtime_modules() -> Non
                 assert node.module != "logging", f"{py_file.name} 违规从内置 logging 导入"
             elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
                 assert node.func.id != "print", f"{py_file.name} 违规使用了 print()"
+
+
+@pytest.mark.asyncio
+async def test_s1_single_pass_temp_scope_attachment_oversize_rehost_and_non_cache(
+    tmp_path: Path,
+) -> None:
+    """验证 S1 附件单次流式落盘复用、Discuz `Content-Type: image` 魔数识别、超 6MB 自动转存图床及失败不进缓存：
+    1. 第一张图：50KB PNG（模拟 S1 返回非标准 `Content-Type: image`），转 Base64 内嵌渲染长图，且 QQ 合并转发直接复用落盘文件，仅发起 1 次 GET；
+    2. 第二张图：6.5MB PNG（超过 6MB 内联内存预算、在 10MB 转发预算内），自动通过 `p.sda1.dev` 转存并预热后写入渲染 HTML，同时合并转发直接复用该落盘原图；
+    3. 当某帖含图片下载失败时（返回 403/500），不会进入 60s 轻量解析缓存（避免坏图缓存污染）。
+    """
+    from contextlib import aclosing
+
+    import main as plugin_pkg
+    from core.temp_manager import TempFileManager
+
+    small_png = _make_png_bytes(400, 300) + b"\x00" * (48 * 1024)
+    # 6.5MB PNG：超过 6MB Base64 卡片内联预算，处于 10MB 流式落盘上限内
+    oversize_png = _make_png_bytes(900, 2400) + b"\x00" * (6_500 * 1024)
+    rendered_card = _make_png_bytes(780, 1800)
+
+    s1_html = """
+    <html><body><div id="postlist">
+      <h1 class="ts"><span id="thread_subject">S1 长图附件单次下载与超限转存测试</span></h1>
+      <div id="post_70521258">
+        <div class="pi"><strong><a id="postnum70521258">楼主</a></strong>
+          <div class="authi"><a href="space-uid-578676.html" class="xw1">lymm2003</a></div>
+        </div>
+        <td id="postmessage_70521258">
+          <p>文字内容</p>
+          <img id="aimg_101" aid="101" src="https://static.stage1st.com/image/common/none.gif"
+               file="https://img.stage1st.com/forum/202611/17/small.png?a=sig1" />
+          <img id="aimg_102" aid="102" src="https://static.stage1st.com/image/common/none.gif"
+               file="https://img.stage1st.com/forum/202611/17/oversize.png?a=sig2" />
+        </td>
+      </div>
+    </div></body></html>
+    """
+
+    mocked = MockHttpRouter()
+    mocked.get(
+        "https://stage1st.com/2b/thread-2294225-1-1.html",
+        status=200,
+        body=s1_html.encode("utf-8"),
+    )
+    mocked.get(
+        "https://img.stage1st.com/forum/202611/17/small.png?a=sig1",
+        status=200,
+        body=small_png,
+        headers={"Content-Type": "image"},
+    )
+    mocked.get(
+        "https://img.stage1st.com/forum/202611/17/oversize.png?a=sig2",
+        status=200,
+        body=oversize_png,
+        headers={"Content-Type": "application/octet-stream"},
+    )
+    mocked.post(
+        "https://p.sda1.dev/api/v1/upload_external_noform?filename=card_2.png",
+        status=200,
+        payload={
+            "success": True,
+            "data": {"url": "https://p.sda1.dev/36/oversize_hash/card_2.png"},
+        },
+    )
+    mocked.get(
+        "https://p.sda1.dev/36/oversize_hash/card_2.png",
+        status=200,
+        body=b"ok",
+        headers={"Content-Type": "image/png"},
+    )
+
+    captured_tmpldata: list[dict[str, Any]] = []
+
+    class CapturingRenderer:
+        async def render_custom_template(
+            self, tmpl_str: str, tmpl_data: dict[str, Any], return_url: bool = False, **_: Any
+        ) -> str:
+            captured_tmpldata.append(dict(tmpl_data))
+            out_p = tmp_path / "card_out.jpg"
+            out_p.write_bytes(rendered_card)
+            return str(out_p)
+
+    ctx = Context(html_renderer=CapturingRenderer())
+    plugin = plugin_pkg.ForumParserPlugin(
+        ctx,
+        config={
+            "render_options": {"embed_images": True, "max_inline_images": 15},
+            "parse_options": {"cooldown_seconds": 0},
+        },
+    )
+    plugin._temp_mgr = TempFileManager(tmp_path / "s1_single_pass")
+    plugin._http_session = aiohttp.ClientSession(middlewares=[mocked.middleware])
+    plugin._ensure_services()
+
+    ev = AstrMessageEvent(
+        "https://stage1st.com/2b/thread-2294225-1-1.html", platform_name="aiocqhttp"
+    )
+    async with aclosing(plugin.on_forum_link_message(ev)) as agen:
+        results = [r async for r in agen]
+
+    assert len(results) == 1
+    nodes = results[0].payload[0].nodes
+    # 摘要 + 长图 + 2张原图 = 4个节点
+    assert len(nodes) == 4
+    assert nodes[2].name == "帖子配图 (1/2)"
+    assert nodes[3].name == "帖子配图 (2/2)"
+
+    # 校验渲染卡片 HTML：第1张为 data:image/png Base64（正确识别裸 `Content-Type: image`），第2张为转存的 p.sda1.dev URL
+    assert len(captured_tmpldata) == 1
+    rendered_html = captured_tmpldata[0]["content_html"]
+    assert "data:image/png;base64," in rendered_html
+    assert "https://p.sda1.dev/36/oversize_hash/card_2.png" in rendered_html
+    assert "img.stage1st.com" not in rendered_html
+
+    # 关键断言：两张 S1 原图各自仅发起了 1 次 GET，合并转发直接复用落盘文件，无二次网络下载！
+    small_gets = [r for r in mocked.requests if r[0] == "GET" and "small.png" in r[1]]
+    oversize_gets = [r for r in mocked.requests if r[0] == "GET" and "oversize.png" in r[1]]
+    assert len(small_gets) == 1
+    assert len(oversize_gets) == 1
+    assert not (tmp_path / "s1_single_pass").exists()
+
+    # 场景 2：当附件拉取失败（403）时，不写入轻量缓存，确保后续请求不会命中残缺页面缓存
+    mocked2 = MockHttpRouter()
+    fail_html = """
+    <html><body><div id="postlist">
+      <h1 class="ts"><span id="thread_subject">失败不缓存测试</span></h1>
+      <div id="post_1"><div class="pi"><strong><a id="postnum1">楼主</a></strong></div>
+        <td id="postmessage_1"><img src="https://img.stage1st.com/forum/fail403.png" /></td>
+      </div>
+    </div></body></html>
+    """
+    mocked2.get(
+        "https://stage1st.com/2b/thread-2299999-1-1.html", status=200, body=fail_html.encode()
+    )
+    mocked2.get("https://img.stage1st.com/forum/fail403.png", status=403, body="Forbidden")
+    await plugin._http_session.close()
+    plugin._http_session = aiohttp.ClientSession(middlewares=[mocked2.middleware])
+    plugin._s1_parser = None
+    plugin._nga_parser = None
+    plugin._bgm_parser = None
+    plugin._renderer = None
+    plugin._telegraph_publisher = None
+    plugin._ensure_services()
+
+    ev2 = AstrMessageEvent(
+        "https://stage1st.com/2b/thread-2299999-1-1.html", platform_name="aiocqhttp"
+    )
+    async with aclosing(plugin.on_forum_link_message(ev2)) as agen:
+        _ = [r async for r in agen]
+
+    cache_key = ("stage1st", "2299999", True, True, 15, False, 15000)
+    assert plugin._parse_cache.get(cache_key) is None
+
+    await plugin.terminate()

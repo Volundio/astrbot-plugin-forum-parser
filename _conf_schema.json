@@ -80,7 +80,7 @@
       "embed_images": {
         "type": "bool",
         "description": "渲染主楼内嵌图片",
-        "hint": "开启后将自动预下载主楼图片（携带论坛登录态与防盗链请求头，单图上限 5MB、整帖合计上限 10MB）并内嵌到渲染卡片中。",
+        "hint": "开启后将自动预下载主楼图片（携带论坛登录态与防盗链请求头，单图上限 6MB、整帖合计上限 12MB；6MB~10MB 防盗链大图自动转存图床）并内嵌到渲染卡片中。",
         "default": true
       },
       "max_inline_images": {
@@ -326,6 +326,25 @@
         "type": "text",
         "description": "NGA 完整 Cookie 字符串（可选）",
         "hint": "也可直接粘贴完整 Cookie 字符串；若上方已填写 UID 与 CID 则无需重复填写。",
+        "default": "",
+        "secret": true
+      }
+    }
+  },
+  "bangumi": {
+    "type": "object",
+    "description": "Bangumi (番组计划) 配置",
+    "items": {
+      "enabled": {
+        "type": "bool",
+        "description": "启用 Bangumi (番组计划) 解析",
+        "hint": "支持解析 bangumi.tv / bgm.tv / chii.in 的小组讨论帖、条目讨论与日志长评（仅在 QQ OneBot 平台生效，Telegram 平台不触发）。",
+        "default": true
+      },
+      "cookie": {
+        "type": "text",
+        "description": "Bangumi 网页 Cookie（可选）",
+        "hint": "部分仅成员可见的小组话题或私密日志可填写浏览器 Cookie（如 chii_auth）。",
         "default": "",
         "secret": true
       }

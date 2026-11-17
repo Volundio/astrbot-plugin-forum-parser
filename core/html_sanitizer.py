@@ -5,7 +5,7 @@ import base64
 import html
 import os
 import re
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from pathlib import Path
@@ -14,13 +14,21 @@ from urllib.parse import urljoin, urlparse, urlunparse
 import aiohttp
 from astrbot.api import logger
 
-from .io_guard import mime_to_ext, sniff_image_mime, stream_response_to_file
+from .io_guard import (
+    mime_to_ext,
+    sniff_image_mime,
+    sniff_known_raster_mime,
+    stream_response_to_file,
+)
 from .temp_manager import TempScope
 
-# HTML 渲染卡片内联图片内存保护预算（单图上限 5MB，整帖原始图片合计上限 10MB；超出部分保留外链或交由磁盘流式转发）
-MAX_CARD_INLINE_SINGLE_BYTES = 5 * 1024 * 1024
-MAX_CARD_INLINE_TOTAL_BYTES = 10 * 1024 * 1024
+# HTML 渲染卡片内联图片内存保护预算（单图上限 6MB，整帖原始图片合计上限 12MB；超出部分可流式转存或跳过并保留原图供转发复用）
+MAX_CARD_INLINE_SINGLE_BYTES = 6 * 1024 * 1024
+MAX_CARD_INLINE_TOTAL_BYTES = 12 * 1024 * 1024
 MAX_CARD_INLINE_TOTAL_B64_BYTES = MAX_CARD_INLINE_TOTAL_BYTES
+
+# 无需内联也无防盗链的公开直链图床域名
+PUBLIC_EXEMPT_CARD_HOSTS = frozenset({"p.sda1.dev", "telegra.ph", "files.catbox.moe"})
 
 # OneBot11 合并转发原图流式落盘预算（单图上限 10MB，单次合并消息本地图片总预算 50MB）
 MAX_FORWARD_SINGLE_IMAGE_BYTES = 10 * 1024 * 1024
@@ -71,6 +79,7 @@ DROP_SUBTREE_TAGS = frozenset(
         "link",
         "base",
         "noscript",
+        "template",
         "svg",
         "math",
         "canvas",
@@ -185,6 +194,11 @@ STYLE_TEXT_ALIGN_RE = re.compile(
     r"(?:^|;)\s*text-align\s*:\s*(left|center|right|justify)\b", re.IGNORECASE
 )
 STYLE_FONT_WEIGHT_RE = re.compile(r"(?:^|;)\s*font-weight\s*:\s*(bold|[6-9]00)\b", re.IGNORECASE)
+STYLE_LINE_THROUGH_RE = re.compile(r"(?:^|;)\s*text-decoration[^;]*\bline-through\b", re.IGNORECASE)
+STYLE_UNDERLINE_RE = re.compile(r"(?:^|;)\s*text-decoration[^;]*\bunderline\b", re.IGNORECASE)
+STYLE_FONT_SIZE_RE = re.compile(
+    r"(?:^|;)\s*font-size\s*:\s*(\d+(?:\.\d+)?)\s*(px|pt)\b", re.IGNORECASE
+)
 SAFE_CSS_COLOR_RE = re.compile(
     r"^(?:#[0-9a-fA-F]{3,6}|[a-zA-Z]{3,20}|rgb\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}\s*\))$"
 )
@@ -440,9 +454,9 @@ def _resolve_url(raw_url: str, base_url: str) -> str:
 
 
 def _is_smiley_image(node: MiniNode, resolved_src: str) -> bool:
-    if node.get_attr("smilieid"):
+    if node.get_attr("smilieid") or node.get_attr("smileid"):
         return True
-    if "forum-smiley" in node.classes or "nga-smiley" in node.classes:
+    if "forum-smiley" in node.classes or "nga-smiley" in node.classes or "smile" in node.classes:
         return True
     low = resolved_src.lower()
     return any(
@@ -451,6 +465,7 @@ def _is_smiley_image(node: MiniNode, resolved_src: str) -> bool:
             "/image/smiley/",
             "/static/image/smiley/",
             "/ngabbs/post/smile/",
+            "/img/smiles/",
             "acniang",
         )
     )
@@ -601,7 +616,7 @@ def _sanitize_node_tree(node: MiniNode, base_url: str) -> list[MiniNode]:
             ]
         return [MiniNode(tag="span", children=clean_children)]
 
-    # 处理 <font> 或带颜色样式的 <span>（自动识别反白剧透文字并高亮展开）
+    # 处理 <font> 或带颜色/装饰样式的 <span>（自动识别反白与 Bangumi mask 剧透文字并展开）
     fg_color = node.get_attr("color")
     bg_color = ""
     if raw_style:
@@ -612,8 +627,10 @@ def _sanitize_node_tree(node: MiniNode, base_url: str) -> list[MiniNode]:
         if m_bg:
             bg_color = m_bg.group(1).strip()
 
-    if tag == "font" or (tag == "span" and (fg_color or bg_color)):
-        if _is_spoiler_color(fg_color, bg_color):
+    if tag == "font" or (
+        tag == "span" and (fg_color or bg_color or raw_style or "text_mask" in node_classes)
+    ):
+        if "text_mask" in node_classes or _is_spoiler_color(fg_color, bg_color):
             return [
                 MiniNode(
                     tag="span",
@@ -621,6 +638,11 @@ def _sanitize_node_tree(node: MiniNode, base_url: str) -> list[MiniNode]:
                     children=clean_children,
                 )
             ]
+        if raw_style and STYLE_LINE_THROUGH_RE.search(raw_style):
+            return [MiniNode(tag="del", attrs={"class": "forum-del"}, children=clean_children)]
+        if raw_style and STYLE_UNDERLINE_RE.search(raw_style) and not fg_color:
+            return [MiniNode(tag="u", children=clean_children)]
+
         safe_styles: list[str] = []
         if fg_color and SAFE_CSS_COLOR_RE.match(fg_color.strip()):
             safe_styles.append(f"color:{fg_color.strip()}")
@@ -628,6 +650,15 @@ def _sanitize_node_tree(node: MiniNode, base_url: str) -> list[MiniNode]:
             m_fw = STYLE_FONT_WEIGHT_RE.search(raw_style)
             if m_fw:
                 safe_styles.append("font-weight:bold")
+            m_fs = STYLE_FONT_SIZE_RE.search(raw_style)
+            if m_fs:
+                raw_val = float(m_fs.group(1))
+                unit = m_fs.group(2).lower()
+                px_val = int(round(raw_val * 1.333)) if unit == "pt" else int(round(raw_val))
+                px_val = max(12, min(26, px_val))
+                safe_styles.append(f"font-size:{px_val}px;line-height:1.45")
+            if STYLE_UNDERLINE_RE.search(raw_style):
+                safe_styles.append("text-decoration:underline")
         attrs: dict[str, str] = {}
         if "forum-spoiler" in node_classes:
             attrs["class"] = "forum-spoiler"
@@ -725,6 +756,26 @@ def _format_dl_exc(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {msg}" if msg else type(exc).__name__
 
 
+def _is_same_site_host(host: str, same_site_hosts: set[str] | None) -> bool:
+    """判断请求域名是否属于站内同源域名或其子域名。"""
+    if not host or not same_site_hosts:
+        return False
+    low = host.lower()
+    if low in same_site_hosts:
+        return True
+    return any(low.endswith(f".{d.lower()}") for d in same_site_hosts if d)
+
+
+def _is_rejected_non_image_ctype(ctype: str) -> bool:
+    """仅拦截明确非图片类型的 Content-Type（兼容 Discuz 裸 `Content-Type: image` 与 `application/octet-stream`）。"""
+    if not ctype:
+        return False
+    low = ctype.lower()
+    if low in {"image/svg+xml", "image/heic", "image/heif"}:
+        return True
+    return low.startswith(("text/", "application/json", "application/xml", "application/xhtml"))
+
+
 def extract_fallback_url_map(content_html: str) -> dict[int, list[str]]:
     """从清洗后的楼层 HTML 中提取每张配图的备选回退 URL 列表（如 Discuz file <-> zoomfile 备选链）。"""
     if not content_html or "data-fallback-src" not in content_html:
@@ -752,6 +803,7 @@ async def _fetch_image_as_data_uri(
     same_site_hosts: set[str] | None = None,
     max_bytes: int = MAX_CARD_INLINE_SINGLE_BYTES,
     fallback_urls: list[str] | tuple[str, ...] = (),
+    error_out: list[str] | None = None,
 ) -> str | None:
     """异步下载单张图片并转换为 Base64 Data URI（支持跨境短超时新连接重试、备选 URL 自动回退与 OOM 预算防线）。"""
     base_headers = {
@@ -759,16 +811,17 @@ async def _fetch_image_as_data_uri(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
         ),
-        "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
         "Referer": referer,
     }
     candidates = [url, *(u for u in fallback_urls if u and u != url)]
-    timeout = aiohttp.ClientTimeout(total=12, connect=4, sock_connect=4, sock_read=8)
+    timeout = aiohttp.ClientTimeout(total=22, connect=4, sock_connect=4, sock_read=12)
+    last_reason = ""
 
     for cand_url in candidates:
         host = (urlparse(cand_url).hostname or "").lower()
-        req_cookies = cookies if (cookies and same_site_hosts and host in same_site_hosts) else None
-        for attempt in range(2):
+        req_cookies = cookies if _is_same_site_host(host, same_site_hosts) else None
+        for attempt in range(3):
             headers = dict(base_headers)
             if attempt > 0:
                 headers["Connection"] = "close"
@@ -781,15 +834,20 @@ async def _fetch_image_as_data_uri(
                     allow_redirects=True,
                 ) as resp:
                     if resp.status != 200:
-                        if (resp.status >= 500 or resp.status == 429) and attempt == 0:
+                        last_reason = f"HTTP {resp.status}"
+                        if (resp.status >= 500 or resp.status == 429) and attempt + 1 < 3:
                             continue
                         break
                     cl_hdr = resp.headers.get("Content-Length")
                     if cl_hdr and cl_hdr.isdigit() and int(cl_hdr) > max_bytes:
+                        last_reason = f"图片体积 ({int(cl_hdr)} bytes) 超过内联预算"
+                        if error_out is not None:
+                            error_out.append(last_reason)
                         return None
 
                     ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-                    if ctype and not ctype.startswith("image/"):
+                    if _is_rejected_non_image_ctype(ctype):
+                        last_reason = f"非预期 Content-Type ({ctype})"
                         break
 
                     chunks: list[bytes] = []
@@ -798,26 +856,44 @@ async def _fetch_image_as_data_uri(
                         total += len(chunk)
                         if total > max_bytes:
                             chunks.clear()
+                            last_reason = f"图片体积超过内联上限 ({max_bytes} bytes)"
+                            if error_out is not None:
+                                error_out.append(last_reason)
                             return None
                         chunks.append(chunk)
 
                     raw = b"".join(chunks)
                     chunks.clear()
                     if not raw:
+                        last_reason = "响应内容为空"
                         break
 
-                    mime = sniff_image_mime(raw[:16], fallback=ctype or "image/png")
+                    known_mime = sniff_known_raster_mime(raw[:16])
+                    if known_mime is None:
+                        if not ctype.startswith("image/") or ctype in {
+                            "image/svg+xml",
+                            "image/heic",
+                            "image/heif",
+                        }:
+                            last_reason = f"无法识别的图片格式 (ctype={ctype or 'unknown'})"
+                            break
+                        mime = sniff_image_mime(raw[:16], fallback=ctype or "image/png")
+                    else:
+                        mime = known_mime
                     if mime == "image/svg+xml":
                         return None
 
                     b64 = base64.b64encode(raw).decode("ascii")
                     return f"data:{mime};base64,{b64}"
             except Exception as e:
-                if attempt == 0:
+                last_reason = _format_dl_exc(e)
+                if attempt + 1 < 3:
                     logger.debug(
-                        f"内联拉取图片第 1 次异常，换新连接重试 ({cand_url}): {_format_dl_exc(e)}"
+                        f"内联拉取图片第 {attempt + 1} 次异常，换新连接重试 ({cand_url}): {last_reason}"
                     )
                     continue
+    if error_out is not None and last_reason:
+        error_out.append(last_reason)
     return None
 
 
@@ -834,6 +910,17 @@ def _data_uri_raw_byte_len(data_uri: str) -> int:
     return max(0, (b64_len * 3) // 4 - pad)
 
 
+def _file_to_data_uri_sync(file_path: Path) -> str:
+    """将已流式校验落盘的单张小于内联上限的图片同步编码为 Data URI。"""
+    raw = file_path.read_bytes()
+    ext_fallback = f"image/{file_path.suffix.lstrip('.').lower() or 'jpeg'}"
+    if ext_fallback == "image/jpg":
+        ext_fallback = "image/jpeg"
+    mime = sniff_image_mime(raw[:16], fallback=ext_fallback)
+    b64 = base64.b64encode(raw).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
+
 async def process_post_html(
     raw_html: str,
     *,
@@ -848,8 +935,17 @@ async def process_post_html(
     enable_length_limit: bool = False,
     max_content_chars: int = 15000,
     out_post_image_urls: list[str] | None = None,
+    temp_scope: TempScope | None = None,
+    rehost_oversize_fn: Callable[[Path, str], Awaitable[str | None]] | None = None,
+    out_downloaded_files: dict[int, str] | None = None,
+    out_has_uninlined_images: list[bool] | None = None,
 ) -> tuple[str, bool, int, int]:
     """执行完整的主楼 HTML 清洗、反白展开、长度保护与图片内嵌流水线。
+
+    当传入 `temp_scope` 且开启 `prefetch_data_uri` 时，采用单次流式落盘统一下载正文配图：
+    - 小于 `6MB`（且累计 `<= 12MB`）的图片直接编码为 Base64 Data URI 内嵌卡片；
+    - 超出内联上限但在 `10MB` 内的防盗链图片通过 `rehost_oversize_fn` 转存至图床供远程渲染加载；
+    - 下载好的本地文件路径记入 `out_downloaded_files`，由下游 OneBot11 合并转发直接复用，避免二次拉取。
 
     Returns:
         (clean_html, is_truncated, char_count, omitted_images_count)
@@ -859,7 +955,7 @@ async def process_post_html(
     for child in parsed_root.children:
         sanitized_root.children.extend(_sanitize_node_tree(child, base_url))
 
-    # 预先提取主楼全量正文图片 URL（不含表情），并标记唯一索引以便合并转发复用内存数据
+    # 预先提取主楼全量正文图片 URL（不含表情），并标记唯一索引以便合并转发复用内存/磁盘数据
     url_to_idx: dict[str, int] = {}
     ordered_post_urls: list[str] = []
     for img_node in sanitized_root.find_all(tag="img"):
@@ -925,71 +1021,187 @@ async def process_post_html(
                 img_node.children = []
 
         if session is not None and prefetch_data_uri:
-            # 预下载表情（最多 30 个唯一 URL）与主楼图片，解决防盗链与需登录附件问题
-            targets: list[MiniNode] = allowed_post_imgs + smiley_imgs[:40]
-            unique_urls: list[str] = []
-            url_fallbacks: dict[str, list[str]] = {}
-            seen_u: set[str] = set()
-            for n in targets:
+            post_unique_urls: list[str] = []
+            post_fallbacks: dict[str, list[str]] = {}
+            post_seen: set[str] = set()
+            for n in allowed_post_imgs:
                 u = n.get_attr("src")
                 fb = n.get_attr("data-fallback-src").strip()
                 if u:
                     if fb:
-                        fb_list = url_fallbacks.setdefault(u, [])
+                        fb_list = post_fallbacks.setdefault(u, [])
                         if fb not in fb_list:
                             fb_list.append(fb)
-                    if u not in seen_u:
-                        seen_u.add(u)
-                        unique_urls.append(u)
+                    if u not in post_seen:
+                        post_seen.add(u)
+                        post_unique_urls.append(u)
 
-            sem = asyncio.Semaphore(3)
-            total_inline_budget = MAX_CARD_INLINE_TOTAL_BYTES
             used_inline_bytes = 0
             url_to_data_uri: dict[str, str] = {}
+            failed_post_download = False
 
-            # 按序分组拉取并在预算耗尽后立即跳过后续大图拉取，按原始图片字节计量防 OOM
-            async def _worker(u: str) -> tuple[str, str | None]:
-                async with sem:
-                    remain = total_inline_budget - used_inline_bytes
-                    if remain <= 0:
-                        return u, None
-                    uri = await _fetch_image_as_data_uri(
-                        session,
-                        u,
-                        referer=referer,
-                        cookies=cookies,
-                        same_site_hosts=same_site_hosts,
-                        max_bytes=min(MAX_CARD_INLINE_SINGLE_BYTES, remain),
-                        fallback_urls=url_fallbacks.get(u, ()),
-                    )
-                    return u, uri
+            # A. 优先独享通道拉取正文配图，不与小表情争抢连接与超时窗口
+            if post_unique_urls and temp_scope is not None:
+                sem_dl = asyncio.Semaphore(2)
+                dl_used_bytes = 0
 
-            for batch_start in range(0, len(unique_urls), 4):
-                if used_inline_bytes >= total_inline_budget:
-                    break
-                batch = unique_urls[batch_start : batch_start + 4]
-                fetched = await asyncio.gather(*(_worker(u) for u in batch))
-                for u, uri in fetched:
-                    if uri is not None:
-                        raw_sz = _data_uri_raw_byte_len(uri)
+                async def _dl_post_to_scope(u: str) -> tuple[str, Path | None, int, str]:
+                    async with sem_dl:
+                        remain_dl = MAX_FORWARD_TOTAL_FILE_BYTES - dl_used_bytes
+                        if remain_dl <= 0:
+                            return u, None, 0, "超出单次原图落盘总预算"
+                        errs: list[str] = []
+                        dest, written = await _stream_single_image_to_scope(
+                            session,
+                            rewrite_legacy_media_url(u),
+                            temp_scope,
+                            referer=referer,
+                            cookies=cookies,
+                            same_site_hosts=same_site_hosts,
+                            max_bytes=min(MAX_FORWARD_SINGLE_IMAGE_BYTES, remain_dl),
+                            fallback_urls=post_fallbacks.get(u, ()),
+                            error_out=errs,
+                        )
+                        return u, dest, written, (errs[-1] if errs else "")
+
+                for b_start in range(0, len(post_unique_urls), 2):
+                    if dl_used_bytes >= MAX_FORWARD_TOTAL_FILE_BYTES:
+                        break
+                    batch = post_unique_urls[b_start : b_start + 2]
+                    dl_results = await asyncio.gather(*(_dl_post_to_scope(u) for u in batch))
+                    for u, local_file, written, err_msg in dl_results:
+                        if local_file is None or written <= 0:
+                            failed_post_download = True
+                            logger.warning(
+                                f"正文配图下载失败，渲染卡片将保留外链 (url={u}): "
+                                f"{err_msg or '空响应或不支持的格式'}"
+                            )
+                            continue
+
+                        dl_used_bytes += written
+                        idx = url_to_idx.get(u)
+                        if out_downloaded_files is not None and idx is not None:
+                            out_downloaded_files[idx] = str(local_file)
+
                         if (
-                            raw_sz <= MAX_CARD_INLINE_SINGLE_BYTES
-                            and (used_inline_bytes + raw_sz) <= total_inline_budget
+                            written <= MAX_CARD_INLINE_SINGLE_BYTES
+                            and (used_inline_bytes + written) <= MAX_CARD_INLINE_TOTAL_BYTES
                         ):
-                            url_to_data_uri[u] = uri
-                            used_inline_bytes += raw_sz
+                            try:
+                                uri = await asyncio.to_thread(_file_to_data_uri_sync, local_file)
+                                url_to_data_uri[u] = uri
+                                used_inline_bytes += written
+                                continue
+                            except Exception as enc_err:
+                                logger.debug(f"本地图片转 Data URI 失败 ({u}): {enc_err}")
 
-            for n in targets:
+                        host = (urlparse(u).hostname or "").lower()
+                        if rehost_oversize_fn is not None and host not in PUBLIC_EXEMPT_CARD_HOSTS:
+                            ext = local_file.suffix or ".jpg"
+                            tag_idx = (idx + 1) if idx is not None else 1
+                            try:
+                                hosted = await rehost_oversize_fn(
+                                    local_file, f"card_{tag_idx}{ext}"
+                                )
+                                if hosted:
+                                    url_to_data_uri[u] = hosted
+                            except Exception as rh_err:
+                                logger.warning(f"超限大图转存图床异常 ({u}): {rh_err}")
+            elif post_unique_urls:
+                sem_in = asyncio.Semaphore(2)
+
+                async def _inline_worker(u: str) -> tuple[str, str | None, str]:
+                    async with sem_in:
+                        remain = MAX_CARD_INLINE_TOTAL_BYTES - used_inline_bytes
+                        if remain <= 0:
+                            return u, None, "超出内联总预算"
+                        errs: list[str] = []
+                        uri = await _fetch_image_as_data_uri(
+                            session,
+                            u,
+                            referer=referer,
+                            cookies=cookies,
+                            same_site_hosts=same_site_hosts,
+                            max_bytes=min(MAX_CARD_INLINE_SINGLE_BYTES, remain),
+                            fallback_urls=post_fallbacks.get(u, ()),
+                            error_out=errs,
+                        )
+                        return u, uri, (errs[-1] if errs else "")
+
+                for b_start in range(0, len(post_unique_urls), 2):
+                    if used_inline_bytes >= MAX_CARD_INLINE_TOTAL_BYTES:
+                        break
+                    batch = post_unique_urls[b_start : b_start + 2]
+                    fetched = await asyncio.gather(*(_inline_worker(u) for u in batch))
+                    for u, uri, err_msg in fetched:
+                        if uri is not None:
+                            raw_sz = _data_uri_raw_byte_len(uri)
+                            if (
+                                raw_sz <= MAX_CARD_INLINE_SINGLE_BYTES
+                                and (used_inline_bytes + raw_sz) <= MAX_CARD_INLINE_TOTAL_BYTES
+                            ):
+                                url_to_data_uri[u] = uri
+                                used_inline_bytes += raw_sz
+                        else:
+                            failed_post_download = True
+                            if err_msg:
+                                logger.warning(f"内联下载配图失败 (url={u}): {err_msg}")
+
+            # B. 其次拉取小表情（上限 40 个，单张不超过 256KB）
+            smiley_unique: list[str] = []
+            smiley_seen: set[str] = set()
+            for n in smiley_imgs[:40]:
                 u = n.get_attr("src")
-                if u in url_to_data_uri:
-                    n.attrs["src"] = url_to_data_uri[u]
+                if u and u not in smiley_seen:
+                    smiley_seen.add(u)
+                    smiley_unique.append(u)
+
+            if smiley_unique:
+                sem_sm = asyncio.Semaphore(4)
+
+                async def _smiley_worker(u: str) -> tuple[str, str | None]:
+                    async with sem_sm:
+                        uri = await _fetch_image_as_data_uri(
+                            session,
+                            u,
+                            referer=referer,
+                            cookies=cookies,
+                            same_site_hosts=same_site_hosts,
+                            max_bytes=256 * 1024,
+                        )
+                        return u, uri
+
+                for b_start in range(0, len(smiley_unique), 4):
+                    batch = smiley_unique[b_start : b_start + 4]
+                    fetched_sm = await asyncio.gather(*(_smiley_worker(u) for u in batch))
+                    for u, uri in fetched_sm:
+                        if uri is not None:
+                            url_to_data_uri[u] = uri
+
+            has_uninlined = failed_post_download
+            for n in allowed_post_imgs:
+                orig_u = n.get_attr("src")
+                if orig_u in url_to_data_uri:
+                    n.attrs["src"] = url_to_data_uri[orig_u]
                     n.attrs.pop("referrerpolicy", None)
-                elif "forum-smiley" in n.classes:
-                    # 表情如果无法下载，优雅降级为内联文字表情标签，绝不展示裂图图标
+                else:
+                    h = (urlparse(orig_u).hostname or "").lower()
+                    if h not in PUBLIC_EXEMPT_CARD_HOSTS:
+                        has_uninlined = True
+
+            for n in smiley_imgs:
+                orig_u = n.get_attr("src")
+                if orig_u in url_to_data_uri:
+                    n.attrs["src"] = url_to_data_uri[orig_u]
+                    n.attrs.pop("referrerpolicy", None)
+                else:
                     alt = n.get_attr("alt") or "表情"
                     n.tag = "span"
                     n.attrs = {"class": "forum-emote"}
                     n.children = [MiniNode(tag="#text", text=f"[{alt}]")]
+
+            if has_uninlined and out_has_uninlined_images is not None:
+                out_has_uninlined_images.append(True)
 
     return sanitized_root.to_html(), is_truncated, char_count, omitted_images_count
 
@@ -1032,12 +1244,12 @@ async def _stream_single_image_to_scope(
         "Referer": referer,
     }
     candidates = [url, *(u for u in fallback_urls if u and u != url)]
-    timeout = aiohttp.ClientTimeout(total=16, connect=4, sock_connect=4, sock_read=10)
+    timeout = aiohttp.ClientTimeout(total=25, connect=4, sock_connect=4, sock_read=12)
     last_reason = ""
 
     for cand_url in candidates:
         host = (urlparse(cand_url).hostname or "").lower()
-        req_cookies = cookies if (cookies and same_site_hosts and host in same_site_hosts) else None
+        req_cookies = cookies if _is_same_site_host(host, same_site_hosts) else None
         for attempt in range(3):
             headers = dict(base_headers)
             if attempt > 0:
@@ -1057,7 +1269,7 @@ async def _stream_single_image_to_scope(
                             continue
                         break
                     ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-                    if ctype and (not ctype.startswith("image/") or ctype == "image/svg+xml"):
+                    if _is_rejected_non_image_ctype(ctype):
                         last_reason = f"非预期 Content-Type ({ctype})"
                         break
 
@@ -1066,10 +1278,25 @@ async def _stream_single_image_to_scope(
                     written, detected_mime = await stream_response_to_file(
                         resp, dest, max_bytes=max_bytes
                     )
-                    if detected_mime == "image/svg+xml":
+                    head_bytes = await asyncio.to_thread(lambda p=dest: p.read_bytes()[:16])
+                    known_mime = sniff_known_raster_mime(head_bytes)
+                    if known_mime is None and (
+                        not ctype.startswith("image/")
+                        or ctype in {"image/svg+xml", "image/heic", "image/heif"}
+                    ):
+                        await asyncio.to_thread(dest.unlink, True)
+                        last_reason = f"无法识别的图片文件头 (ctype={ctype or 'unknown'})"
+                        break
+                    final_mime = known_mime or detected_mime
+                    if final_mime == "image/svg+xml":
                         await asyncio.to_thread(dest.unlink, True)
                         last_reason = "跳过 SVG 矢量文件"
                         return None, 0
+                    actual_ext = mime_to_ext(final_mime)
+                    if actual_ext and actual_ext != ext:
+                        renamed = scope.alloc_file(prefix="post_img", ext=actual_ext)
+                        await asyncio.to_thread(os.replace, dest, renamed)
+                        dest = renamed
                     return dest, written
             except ValueError as ve:
                 if dest is not None:
@@ -1105,6 +1332,7 @@ async def prepare_post_images_for_forward(
     same_site_hosts: set[str] | None = None,
     max_single_bytes: int = MAX_FORWARD_SINGLE_IMAGE_BYTES,
     max_total_bytes: int = MAX_FORWARD_TOTAL_FILE_BYTES,
+    pre_downloaded_files: dict[int, str] | None = None,
 ) -> tuple[list[str], int]:
     """准备用于 OneBot11 合并转发的帖子原图本地文件列表（流式落盘防 OOM，发送后由 TempScope 立即清空）。
 
@@ -1124,6 +1352,25 @@ async def prepare_post_images_for_forward(
     overflow_by_count = max(0, len(post_image_urls) - len(target_urls))
     idx_to_file: dict[int, Path] = {}
     used_file_bytes = 0
+
+    # 0. 优先复用渲染卡片阶段已流式落盘且尚在本请求 TempScope 中的本地原图文件，避免二次下载
+    if pre_downloaded_files:
+        for idx in range(len(target_urls)):
+            raw_path = pre_downloaded_files.get(idx)
+            if not raw_path:
+                continue
+            p = Path(raw_path)
+            try:
+                st = await asyncio.to_thread(p.stat)
+            except OSError:
+                continue
+            if (
+                st.st_size > 0
+                and st.st_size <= max_single_bytes
+                and (used_file_bytes + st.st_size) <= max_total_bytes
+            ):
+                idx_to_file[idx] = p
+                used_file_bytes += st.st_size
 
     # 1. 逐个扫描已内嵌 Data URI 并逐张解码落盘（不重新构建 DOM，也不把多张图同时堆在字典内存里）
     if content_html and "data:image/" in content_html:

@@ -224,8 +224,8 @@ async def test_oom_guards_stream_limit_and_forward_budget_and_concurrency(tmp_pa
         stream_response_to_file,
     )
 
-    assert MAX_CARD_INLINE_SINGLE_BYTES == 5 * 1024 * 1024
-    assert MAX_CARD_INLINE_TOTAL_BYTES == 10 * 1024 * 1024
+    assert MAX_CARD_INLINE_SINGLE_BYTES == 6 * 1024 * 1024
+    assert MAX_CARD_INLINE_TOTAL_BYTES == 12 * 1024 * 1024
     assert MAX_FORWARD_SINGLE_IMAGE_BYTES == 10 * 1024 * 1024
     assert MAX_FORWARD_TOTAL_FILE_BYTES == 50 * 1024 * 1024
 

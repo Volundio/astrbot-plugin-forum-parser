@@ -2,6 +2,22 @@
 
 All notable changes to `astrbot_plugin_forum_parser` will be documented in this file.
 
+## [v0.4.0] - 2026-11-18
+
+### Added
+- **新增 Bangumi 番组计划（`bangumi.tv` / `bgm.tv` / `chii.in`）解析支持**：
+  - 支持识别并解析三大等价域名的**小组讨论帖**（`/group/topic/...`、`/rakuen/topic/group/...`）、**条目讨论帖**（`/subject/topic/...`）以及**日志长评**（`/blog/...`），同步支持 `#post_...` 指定回复/楼中楼楼层精准解析（自动附带父楼层引用语境），并自动忽略普通条目详情页（如 `/subject/123`）。
+  - 严格限定平台作用域：**仅在 QQ OneBot (`aiocqhttp`) 平台触发解析 Bangumi 链接，对 Telegram 平台收到的 Bangumi 链接完全不解析**。
+  - 集成主网页 DOM 提取 + `next.bgm.tv/p1` 公开接口兜底（含 Bangumi BBCode 及 `(bgmXX)` 表情完整转换），完整提取帖子正文、作者署名、预估阅读时长、`[mask]` 剧透条、贴贴表态分布（`data_likes_list`）与关联作品条目封面卡片。
+- **专属 Bangumi 渲染卡片模板（`core/templates/bangumi_card.html`）**：
+  - 采用 Bangumi 经典樱花粉（`#F09199`）主题配色并支持暗色/极简浅色切换，专设小组徽标、阅读时长胶囊、贴贴表情计数栏与 2 列关联作品条目卡片区。
+
+### Fixed
+- **彻底修复 QQ 渲染长图中 S1 附件裂图但合并转发单独能发出（如 `thread-2294225`）的问题**：
+  - 打通卡片内联与合并转发下载管线为**单次流式落盘复用**：正文配图独享通道率先下载（放宽跨境超时至 `25s`、`sock_read=12s`、最多 3 次新连接重试），不再与小表情争抢连接；卡片内联上限提升至单图 `6MB` / 合计 `12MB`，超出内联上限但在 `10MB` 内的防盗链图片自动转存至 `p.sda1.dev` 供远程渲染器绘制；已落盘原图直接复用于合并转发，彻底消除二次下载与条件不一致。
+  - 修复 Discuz 动态附件接口返回非标准 `Content-Type: image` 或字节流时的预检误杀，改为基于二进制魔数校验；放宽 `.stage1st.com` 全子域 Cookie 匹配。
+  - 移除 `.forum-img` 的 `max-height: 1100px` 限高裁切，竖长截图不再在卡片中被缩窄变形；含下载失败配图的结果不再写入轻量缓存。
+
 ## [v0.3.2] - 2026-11-18
 
 ### Fixed

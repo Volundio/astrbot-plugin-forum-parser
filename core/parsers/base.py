@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 
 import aiohttp
 
 from ..models import ForumLink, ParsedThread
+from ..temp_manager import TempScope
 
 DEFAULT_BROWSER_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -70,6 +72,8 @@ class BaseForumParser(ABC):
         max_inline_images: int = 15,
         enable_length_limit: bool = False,
         max_content_chars: int = 15000,
+        temp_scope: TempScope | None = None,
+        rehost_oversize_fn: Callable[[Path, str], Awaitable[str | None]] | None = None,
     ) -> ParsedThread:
         """解析帖子主楼并返回统一的 ParsedThread 结构。"""
         raise NotImplementedError

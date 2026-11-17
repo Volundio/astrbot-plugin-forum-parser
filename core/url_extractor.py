@@ -29,6 +29,16 @@ NGA_ALIAS_HOSTS = {
     "bbs.ngacn.cc",
 }
 
+# Bangumi (番组计划) 官方三域名集合（三者等价互通）
+BANGUMI_HOSTS = {
+    "bangumi.tv",
+    "www.bangumi.tv",
+    "bgm.tv",
+    "www.bgm.tv",
+    "chii.in",
+    "www.chii.in",
+}
+
 # 常见跳转包装域名（如 QQ 链接安全跳转）
 REDIRECT_WRAPPER_HOSTS = {
     "c.pc.qq.com",
@@ -52,6 +62,16 @@ S1_FRAGMENT_PID_PATTERN = re.compile(r"^(?:pid|post_)(\d+)$", re.IGNORECASE)
 # NGA 锚点匹配（如 #pid795123456Anchor 或 #l25）
 NGA_FRAGMENT_PID_PATTERN = re.compile(r"^pid(\d+)(?:anchor)?$", re.IGNORECASE)
 NGA_FRAGMENT_FLOOR_PATTERN = re.compile(r"^l(\d+)$", re.IGNORECASE)
+
+# Bangumi 小组话题 / 条目讨论 / 日志长评路径与楼层锚点匹配
+BGM_GROUP_TOPIC_PATTERN = re.compile(
+    r"^/(?:group/topic|(?:rakuen|m)/topic/group)/(\d+)/?$", re.IGNORECASE
+)
+BGM_SUBJECT_TOPIC_PATTERN = re.compile(
+    r"^/(?:subject/topic|(?:rakuen|m)/topic/subject)/(\d+)/?$", re.IGNORECASE
+)
+BGM_BLOG_PATTERN = re.compile(r"^/(?:blog|(?:rakuen|m)/topic/blog)/(\d+)/?$", re.IGNORECASE)
+BGM_FRAGMENT_POST_PATTERN = re.compile(r"^post_(\d+)$", re.IGNORECASE)
 
 
 def _strip_trailing_punctuation(raw_url: str) -> str:
@@ -91,8 +111,9 @@ def parse_forum_url(
     allow_alias_domains: bool = True,
     enable_s1: bool = True,
     enable_nga: bool = True,
+    enable_bangumi: bool = True,
 ) -> ForumLink | None:
-    """尝试将单个 URL 解析为受支持的论坛主楼链接。"""
+    """尝试将单个 URL 解析为受支持的论坛主楼或指定楼层链接。"""
     if not raw_url:
         return None
 
@@ -254,6 +275,48 @@ def parse_forum_url(
                 )
         return None
 
+    # 3. Bangumi 识别（仅支持小组讨论、条目讨论与日志长评，排除普通 /subject 条目/章节页）
+    if enable_bangumi and host in BANGUMI_HOSTS:
+        path = parsed.path or ""
+        frag = (parsed.fragment or "").strip()
+        pid = ""
+        m_bpid = BGM_FRAGMENT_POST_PATTERN.match(frag)
+        if m_bpid and int(m_bpid.group(1)) > 0:
+            pid = m_bpid.group(1)
+
+        sub_type = ""
+        tid = ""
+        base_canonical = ""
+        m_grp = BGM_GROUP_TOPIC_PATTERN.match(path)
+        if m_grp and int(m_grp.group(1)) > 0:
+            sub_type = "group_topic"
+            tid = m_grp.group(1)
+            base_canonical = f"https://bangumi.tv/group/topic/{tid}"
+        else:
+            m_subj = BGM_SUBJECT_TOPIC_PATTERN.match(path)
+            if m_subj and int(m_subj.group(1)) > 0:
+                sub_type = "subject_topic"
+                tid = m_subj.group(1)
+                base_canonical = f"https://bangumi.tv/subject/topic/{tid}"
+            else:
+                m_blog = BGM_BLOG_PATTERN.match(path)
+                if m_blog and int(m_blog.group(1)) > 0:
+                    sub_type = "blog"
+                    tid = m_blog.group(1)
+                    base_canonical = f"https://bangumi.tv/blog/{tid}"
+
+        if tid and base_canonical:
+            canonical = f"{base_canonical}#post_{pid}" if pid else base_canonical
+            return ForumLink(
+                forum=ForumType.BANGUMI,
+                tid=tid,
+                original_url=cleaned,
+                canonical_url=canonical,
+                pid=pid,
+                sub_type=sub_type,
+            )
+        return None
+
     return None
 
 
@@ -339,6 +402,7 @@ def extract_forum_links_from_event(
     parse_share_cards: bool = True,
     enable_s1: bool = True,
     enable_nga: bool = True,
+    enable_bangumi: bool = True,
 ) -> list[ForumLink]:
     """从 AstrBot 消息事件（支持 OneBot11 与 Telegram）提取去重后的论坛帖子链接列表。"""
     candidate_urls: list[str] = []
@@ -391,6 +455,7 @@ def extract_forum_links_from_event(
             allow_alias_domains=allow_alias_domains,
             enable_s1=enable_s1,
             enable_nga=enable_nga,
+            enable_bangumi=enable_bangumi,
         )
         if link is None:
             continue

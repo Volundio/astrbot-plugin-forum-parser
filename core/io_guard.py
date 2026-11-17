@@ -24,8 +24,8 @@ class ConcurrencyLimitError(ForumParseError):
     """并发排队任务过多保护异常。"""
 
 
-def sniff_image_mime(head: bytes, fallback: str = "image/jpeg") -> str:
-    """根据文件头魔数识别图片 MIME 类型。"""
+def sniff_known_raster_mime(head: bytes) -> str | None:
+    """根据文件头魔数严格识别常见位图格式 MIME（无法识别时返回 None，用于防 HTML 伪图污染）。"""
     if head.startswith(b"\x89PNG\r\n\x1a\n"):
         return "image/png"
     if head.startswith(b"\xff\xd8\xff"):
@@ -34,7 +34,16 @@ def sniff_image_mime(head: bytes, fallback: str = "image/jpeg") -> str:
         return "image/gif"
     if len(head) >= 12 and head[:4] == b"RIFF" and head[8:12] == b"WEBP":
         return "image/webp"
-    return fallback
+    if len(head) >= 12 and head[4:8] == b"ftyp" and head[8:12] in {b"avif", b"avis"}:
+        return "image/avif"
+    if len(head) >= 14 and head[:2] == b"BM":
+        return "image/bmp"
+    return None
+
+
+def sniff_image_mime(head: bytes, fallback: str = "image/jpeg") -> str:
+    """根据文件头魔数识别图片 MIME 类型。"""
+    return sniff_known_raster_mime(head) or fallback
 
 
 def mime_to_ext(mime: str) -> str:
@@ -45,6 +54,10 @@ def mime_to_ext(mime: str) -> str:
         return "gif"
     if "webp" in m:
         return "webp"
+    if "avif" in m:
+        return "avif"
+    if "bmp" in m:
+        return "bmp"
     return "jpg"
 
 

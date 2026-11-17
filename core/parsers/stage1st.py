@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -25,6 +27,7 @@ from ..models import (
     ParsedThread,
     RateItem,
 )
+from ..temp_manager import TempScope
 from .base import DEFAULT_BROWSER_UA, BaseForumParser, parse_cookie_string
 
 S1_WEB_BASE = "https://stage1st.com/2b/"
@@ -807,7 +810,33 @@ class Stage1stParser(BaseForumParser):
         extra_attach_imgs: list[str] = []
         if pattl:
             for img in pattl.find_all(tag="img"):
-                aid = img.get_attr("aid") or img.get_attr("id").removeprefix("aimg_")
+                # 排除 tip/tip_4 浮层菜单内的操作按钮与加载/文件类型小图标
+                in_tip = False
+                cur_p = img.parent
+                while cur_p is not None and cur_p is not pattl:
+                    if cur_p.classes & {"tip", "tip_4"}:
+                        in_tip = True
+                        break
+                    cur_p = cur_p.parent
+                if in_tip:
+                    continue
+                cand_src = (
+                    img.get_attr("file") or img.get_attr("zoomfile") or img.get_attr("src")
+                ).lower()
+                if any(
+                    noise in cand_src
+                    for noise in ("rleft.gif", "rright.gif", "loading.gif", "/filetype/")
+                ):
+                    continue
+                img_id = img.get_attr("id")
+                if not (
+                    img.get_attr("aid")
+                    or img.get_attr("zoomfile")
+                    or img.get_attr("file")
+                    or img_id.startswith("aimg_")
+                ):
+                    continue
+                aid = img.get_attr("aid") or img_id.removeprefix("aimg_")
                 if aid and aid in referenced_aids:
                     continue
                 extra_attach_imgs.append(img.to_html())
@@ -866,6 +895,8 @@ class Stage1stParser(BaseForumParser):
         max_inline_images: int = 15,
         enable_length_limit: bool = False,
         max_content_chars: int = 15000,
+        temp_scope: TempScope | None = None,
+        rehost_oversize_fn: Callable[[Path, str], Awaitable[str | None]] | None = None,
     ) -> ParsedThread:
         tid = link.tid
         target_pid = link.pid
@@ -1064,6 +1095,8 @@ class Stage1stParser(BaseForumParser):
             title = f"Stage1st 主题 #{tid}" if tid else f"Stage1st 回复 #{parsed_pid}"
 
         post_image_urls: list[str] = []
+        pre_downloaded_files: dict[int, str] = {}
+        uninlined_flags: list[bool] = []
         clean_html, is_truncated, char_count, omitted_imgs = await process_post_html(
             raw_post_html,
             base_url=S1_WEB_BASE,
@@ -1077,6 +1110,10 @@ class Stage1stParser(BaseForumParser):
             enable_length_limit=enable_length_limit,
             max_content_chars=max_content_chars,
             out_post_image_urls=post_image_urls,
+            temp_scope=temp_scope,
+            rehost_oversize_fn=rehost_oversize_fn,
+            out_downloaded_files=pre_downloaded_files,
+            out_has_uninlined_images=uninlined_flags,
         )
 
         # 预下载发言人头像为 Data URI 防止远端渲染器无法加载防盗链头像
@@ -1119,6 +1156,8 @@ class Stage1stParser(BaseForumParser):
             rate_summary=rate_summary,
             rates=rates,
             post_image_urls=post_image_urls,
+            pre_downloaded_files=pre_downloaded_files,
+            has_uninlined_images=bool(uninlined_flags),
         )
 
     async def get_media_auth_context(self) -> tuple[dict[str, str] | None, set[str]]:

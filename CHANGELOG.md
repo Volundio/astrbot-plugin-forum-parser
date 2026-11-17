@@ -2,6 +2,12 @@
 
 All notable changes to `astrbot_plugin_forum_parser` will be documented in this file.
 
+## [v0.2.1] - 2026-11-17
+
+### Improved
+- **NGA 单回复楼层真实楼层号还原优化**：
+  - 针对 NGA `read.php?pid=...&opt=128` 纯 `pid` 链接，自动通过 `to=1` 302 跳转反查真实页码并获取准确的楼层号（如 `41楼`、`45楼`），避免 NGA 单条 `pid` 接口将 `lou` 固定置为 `0` 导致楼层号丢失；对 `read.php?tid=...&page=...#pid...Anchor` 锚点链接直接单次请求目标页提取真实楼层号与用户组名称。
+
 ## [v0.2.0] - 2026-11-17
 
 ### Added

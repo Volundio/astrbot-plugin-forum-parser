@@ -162,34 +162,72 @@ async def test_nga_fallback_to_app_api() -> None:
 
 @pytest.mark.asyncio
 async def test_nga_specific_pid_floor_parse() -> None:
-    """验证 NGA 带 pid 的单回复链接解析对应楼层而非主楼。"""
+    """验证 NGA 两种楼层链接格式（#pid...Anchor 与 ?pid=...&opt=128）均能精准解析对应楼层及真实楼层号。"""
     from core.url_extractor import parse_forum_url
 
-    link = parse_forum_url("https://bbs.nga.cn/read.php?pid=795123456")
-    assert link is not None
+    # 格式 1：https://bbs.nga.cn/read.php?tid=47926153&page=3#pid888015021Anchor
+    link_anchor = parse_forum_url(
+        "https://bbs.nga.cn/read.php?tid=47926153&page=3#pid888015021Anchor"
+    )
+    assert link_anchor is not None
+    assert link_anchor.tid == "47926153"
+    assert link_anchor.pid == "888015021"
+    assert link_anchor.page == 3
 
-    nga_pid_json = (
+    page3_json = (
         '{"data":{'
-        '"__F":{"name":"猴区"},'
-        '"__T":{"tid":42396123,"subject":"NGA单楼层解析测试","authorid":10001,"replies":30},'
-        '"__U":{"20002":{"username":"回帖水友"}},'
-        '"__R":{"0":{"pid":795123456,"lou":15,"authorid":20002,"postdate":1763376500,"score":9,"content":"这是第 15 楼的单独回复内容"}}'
+        '"__F":{"name":"二次元国家地理"},'
+        '"__T":{"tid":47926153,"subject":"影之刃这个剧情真的算武侠吗？","authorid":64900567,"replies":74},'
+        '"__U":{"42850840":{"username":"UID:42850840","memberid":39},"__GROUPS":{"39":["学徒",98528,39]}},'
+        '"__R":[{"pid":888015021,"lou":41,"authorid":42850840,"postdate":"2026-11-16 00:04","score":5,"content":"自己去看忠义关公像的介绍"}]'
         "}}"
     )
+
+    # 格式 2：https://bbs.nga.cn/read.php?pid=888015830&opt=128（通过 to=1 的 302 定位真实页码与楼层号）
+    link_pid_opt = parse_forum_url("https://bbs.nga.cn/read.php?pid=888015830&opt=128")
+    assert link_pid_opt is not None
+    assert link_pid_opt.pid == "888015830"
+
+    page3_json_b = (
+        '{"data":{'
+        '"__F":{"name":"二次元国家地理"},'
+        '"__T":{"tid":47926153,"subject":"影之刃这个剧情真的算武侠吗？","authorid":64900567,"replies":74},'
+        '"__U":{"67401747":{"username":"UID:67401747","memberid":39},"__GROUPS":{"39":["学徒",98528,39]}},'
+        '"__R":[{"pid":888015830,"lou":45,"authorid":67401747,"postdate":"2026-11-16 00:19","score":11,"content":"即便是金庸也在不断进化"}]'
+        "}}"
+    )
+
     mocked = MockHttpRouter()
     mocked.get(
-        "https://bbs.nga.cn/read.php?pid=795123456&__output=11",
+        "https://bbs.nga.cn/read.php?tid=47926153&page=3&__output=11",
         status=200,
-        body=nga_pid_json.encode("utf-8"),
+        body=page3_json.encode("utf-8"),
+    )
+    mocked.get(
+        "https://bbs.nga.cn/read.php?pid=888015830&to=1",
+        status=302,
+        headers={"Location": "/read.php?tid=47926153&page=3#pid888015830Anchor"},
+    )
+    mocked.get(
+        "https://bbs.nga.cn/read.php?tid=47926153&page=3&__output=11",
+        status=200,
+        body=page3_json_b.encode("utf-8"),
     )
 
     async with aiohttp.ClientSession(middlewares=[mocked.middleware]) as session:
         parser = NgaParser(session, config={"enabled": True})
-        res = await parser.parse_thread(link, embed_images=False)
+        res_a = await parser.parse_thread(link_anchor, embed_images=False)
+        res_b = await parser.parse_thread(link_pid_opt, embed_images=False)
 
-    assert res.tid == "42396123"
-    assert res.pid == "795123456"
-    assert res.is_main_post is False
-    assert res.floor_label == "15楼"
-    assert res.author == "回帖水友"
-    assert "第 15 楼的单独回复内容" in res.content_html
+    assert res_a.tid == "47926153"
+    assert res_a.pid == "888015021"
+    assert res_a.is_main_post is False
+    assert res_a.floor_label == "41楼"
+    assert res_a.author_group == "学徒"
+    assert "忠义关公像" in res_a.content_html
+
+    assert res_b.tid == "47926153"
+    assert res_b.pid == "888015830"
+    assert res_b.is_main_post is False
+    assert res_b.floor_label == "45楼"
+    assert "即便是金庸也在不断进化" in res_b.content_html

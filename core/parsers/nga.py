@@ -7,6 +7,7 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 import aiohttp
 
@@ -178,8 +179,11 @@ def convert_nga_bbcode_to_html(
     attach_map = attach_url_map or {}
     used_attach_urls: set[str] = set()
 
-    # 1. 统一换行并反转义 HTML 实体
+    # 1. 统一换行、兼容 app_api.php 预转换的 <del> 标签并反转义 HTML 实体
     text = BR_TAG_RE.sub("\n", raw_content)
+    text = re.sub(
+        r"<del\b[^>]*>(.*?)</del>", r"[del]\1[/del]", text, flags=re.IGNORECASE | re.DOTALL
+    )
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = html.unescape(text)
 
@@ -522,6 +526,37 @@ class NgaParser(BaseForumParser):
         except json.JSONDecodeError:
             return None
 
+    async def _resolve_pid_page_via_redirect(
+        self, pid: str, cookies: dict[str, str]
+    ) -> tuple[str, int]:
+        """对纯 pid 链接请求 read.php?pid=...&to=1 的 302 Location 头，反查所属 tid 与真实所在页码。"""
+        url = f"https://bbs.nga.cn/read.php?pid={pid}&to=1"
+        headers = {
+            "User-Agent": NGA_READ_UA,
+            "Referer": f"https://bbs.nga.cn/read.php?pid={pid}",
+        }
+        timeout = aiohttp.ClientTimeout(total=6, connect=3, sock_connect=3, sock_read=4)
+        try:
+            async with self.session.get(
+                url,
+                headers=headers,
+                cookies=cookies or None,
+                timeout=timeout,
+                allow_redirects=False,
+            ) as resp:
+                loc = resp.headers.get("Location") or ""
+                if loc:
+                    parsed = urlparse(loc)
+                    qs = parse_qs(parsed.query)
+                    r_tid = (qs.get("tid") or [""])[0]
+                    r_page = (qs.get("page") or ["1"])[0]
+                    if r_tid.isdigit() and int(r_tid) > 0:
+                        p_num = int(r_page) if r_page.isdigit() and int(r_page) > 0 else 1
+                        return r_tid, p_num
+        except Exception:
+            pass
+        return "", 0
+
     async def _fetch_via_read_php(
         self,
         tid: str,
@@ -690,14 +725,18 @@ class NgaParser(BaseForumParser):
         lou_num = int(lou_raw) if (lou_raw is not None and str(lou_raw).isdigit()) else 0
         op_author_id = str(t_info.get("authorid") or "")
         author_id = str(target_post.get("authorid") or op_author_id or "")
-        is_op_reply = bool(lou_num > 0 and op_author_id and author_id == op_author_id)
+        is_non_main_pid = bool(post_pid.isdigit() and int(post_pid) > 0)
+        is_op_reply = bool(
+            (lou_num > 0 or is_non_main_pid) and op_author_id and author_id == op_author_id
+        )
 
         if lou_num > 0:
             is_main_post = False
             floor_label = f"楼主 · {lou_num}楼" if is_op_reply else f"{lou_num}楼"
-        elif target_pid and lou_raw is None:
+        elif is_non_main_pid or target_pid:
+            # NGA 的单回复接口 read.php?pid=... 会固定把单条结果的 lou 填为 0，而主楼真实 pid 恒为 0
             is_main_post = False
-            floor_label = f"PID #{post_pid}"
+            floor_label = f"楼主 · PID #{post_pid}" if is_op_reply else f"PID #{post_pid}"
         else:
             is_main_post = True
             floor_label = "楼主 · 1L"
@@ -723,8 +762,16 @@ class NgaParser(BaseForumParser):
 
         author = str(t_info.get("author") or "") if is_main_post else ""
         author_avatar = ""
-        if isinstance(u_map, dict) and author_id in u_map and isinstance(u_map[author_id], dict):
-            u_obj = u_map[author_id]
+        author_group = ""
+        u_obj = None
+        if isinstance(u_map, dict):
+            cand = u_map.get(author_id)
+            if not isinstance(cand, dict) and author_id.isdigit():
+                cand = u_map.get(int(author_id))
+            if isinstance(cand, dict):
+                u_obj = cand
+
+        if u_obj is not None:
             author = str(u_obj.get("username") or author)
             av = u_obj.get("avatar")
             if isinstance(av, str) and av.startswith("http"):
@@ -734,6 +781,12 @@ class NgaParser(BaseForumParser):
                     if isinstance(av_v, str) and av_v.startswith("http"):
                         author_avatar = av_v
                         break
+            groups_map = u_map.get("__GROUPS") if isinstance(u_map, dict) else None
+            member_id = str(u_obj.get("memberid") or "")
+            if isinstance(groups_map, dict) and member_id in groups_map:
+                g_entry = groups_map[member_id]
+                if isinstance(g_entry, list) and g_entry and g_entry[0]:
+                    author_group = str(g_entry[0])
         if not author and author_id:
             author = f"UID:{author_id}"
 
@@ -810,6 +863,7 @@ class NgaParser(BaseForumParser):
             "author": author or "未知作者",
             "author_id": author_id,
             "author_avatar": author_avatar,
+            "author_group": author_group,
             "created_at": created_at,
             "replies": replies,
             "score": score,
@@ -862,14 +916,15 @@ class NgaParser(BaseForumParser):
         )
         op_uid = str(payload.get("tauthorid") or "")
         author_id = str((author_obj or {}).get("uid") or (op_uid if lou_num == 0 else ""))
-        is_op_reply = bool(lou_num > 0 and op_uid and author_id == op_uid)
+        is_non_main_pid = bool(post_pid.isdigit() and int(post_pid) > 0)
+        is_op_reply = bool((lou_num > 0 or is_non_main_pid) and op_uid and author_id == op_uid)
 
         if lou_num > 0:
             is_main_post = False
             floor_label = f"楼主 · {lou_num}楼" if is_op_reply else f"{lou_num}楼"
-        elif target_pid and lou_raw is None:
+        elif is_non_main_pid or target_pid:
             is_main_post = False
-            floor_label = f"PID #{post_pid}"
+            floor_label = f"楼主 · PID #{post_pid}" if is_op_reply else f"PID #{post_pid}"
         else:
             is_main_post = True
             floor_label = "楼主 · 1L"
@@ -934,10 +989,11 @@ class NgaParser(BaseForumParser):
             "is_thread_author": is_op_reply,
             "title": title,
             "category": category,
-            "forum_name": str(payload.get("fname") or "NGA 玩家社区"),
+            "forum_name": str(payload.get("forum_name") or payload.get("fname") or "NGA 玩家社区"),
             "author": author,
             "author_id": author_id,
             "author_avatar": author_avatar,
+            "author_group": str((author_obj or {}).get("member") or ""),
             "created_at": created_at,
             "replies": None,
             "score": score,
@@ -963,34 +1019,64 @@ class NgaParser(BaseForumParser):
         )
 
         cookies, has_auth = self._build_cookies()
-
-        read_data, err_read = await self._fetch_via_read_php(
-            tid, cookies, pid=target_pid, page=req_page
-        )
         extracted: dict[str, Any] | None = None
+        err_read = ""
+        err_app = ""
 
-        if read_data is not None:
-            extracted = self._extract_from_read_data(
-                tid, read_data, target_pid=target_pid, target_floor=target_floor
-            )
-        else:
-            app_data, err_app = await self._fetch_via_app_api(
+        # 若为指定 pid 链接，优先按所在页整页拉取以拿到 NGA 真实楼层号 (lou)；若无页码则通过 to=1 302 定位页码
+        if target_pid:
+            loc_tid = tid
+            loc_page = link.page if (tid and link.page > 1) else 0
+            if not loc_tid or loc_page <= 0:
+                r_tid, r_page = await self._resolve_pid_page_via_redirect(target_pid, cookies)
+                if r_tid:
+                    loc_tid = r_tid
+                    loc_page = r_page
+
+            if loc_tid and loc_page >= 1:
+                page_data, _ = await self._fetch_via_read_php(
+                    loc_tid, cookies, pid="", page=loc_page
+                )
+                if page_data is not None:
+                    try:
+                        cand = self._extract_from_read_data(
+                            loc_tid, page_data, target_pid=target_pid
+                        )
+                        if cand.get("pid") == target_pid and "楼" in str(
+                            cand.get("floor_label") or ""
+                        ):
+                            extracted = cand
+                            tid = loc_tid
+                            req_page = loc_page
+                    except ForumParseError:
+                        pass
+
+        if extracted is None:
+            read_data, err_read = await self._fetch_via_read_php(
                 tid, cookies, pid=target_pid, page=req_page
             )
-            if app_data is not None:
-                extracted = self._extract_from_app_data(
-                    tid, app_data, target_pid=target_pid, target_floor=target_floor
+            if read_data is not None:
+                extracted = self._extract_from_read_data(
+                    tid, read_data, target_pid=target_pid, target_floor=target_floor
                 )
             else:
-                combined_err = err_read or err_app or "未知错误"
-                if not has_auth and any(
-                    k in combined_err for k in ("登录", "权限", "403", "401", "隐藏", "访客")
-                ):
-                    raise ForumLoginRequiredError(
-                        f"NGA 帖子访问受限（{combined_err}），请在插件设置中配置 ngaPassportUid 与 ngaPassportCid。"
+                app_data, err_app = await self._fetch_via_app_api(
+                    tid, cookies, pid=target_pid, page=req_page
+                )
+                if app_data is not None:
+                    extracted = self._extract_from_app_data(
+                        tid, app_data, target_pid=target_pid, target_floor=target_floor
                     )
-                id_desc = f"pid={target_pid}" if target_pid else f"tid={tid}"
-                raise ForumParseError(f"无法解析 NGA 帖子 ({id_desc})：{combined_err}")
+                else:
+                    combined_err = err_read or err_app or "未知错误"
+                    if not has_auth and any(
+                        k in combined_err for k in ("登录", "权限", "403", "401", "隐藏", "访客")
+                    ):
+                        raise ForumLoginRequiredError(
+                            f"NGA 帖子访问受限（{combined_err}），请在插件设置中配置 ngaPassportUid 与 ngaPassportCid。"
+                        )
+                    id_desc = f"pid={target_pid}" if target_pid else f"tid={tid}"
+                    raise ForumParseError(f"无法解析 NGA 帖子 ({id_desc})：{combined_err}")
 
         resolved_tid = extracted["tid"] or tid
         resolved_pid = extracted["pid"] or target_pid
@@ -1061,6 +1147,7 @@ class NgaParser(BaseForumParser):
             author=extracted["author"],
             author_id=extracted["author_id"],
             author_avatar=author_avatar,
+            author_group=extracted.get("author_group", ""),
             forum_name=extracted["forum_name"],
             category=extracted["category"],
             created_at=extracted["created_at"],

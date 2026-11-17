@@ -533,14 +533,17 @@ class NgaParser(BaseForumParser):
             "Referer": f"https://bbs.nga.cn/read.php?tid={tid}",
         }
         req_cookies = dict(cookies)
-        timeout = aiohttp.ClientTimeout(total=15)
+        timeout = aiohttp.ClientTimeout(total=12, connect=4, sock_connect=4, sock_read=8)
         last_msg = ""
 
         for attempt in range(2):
+            req_headers = dict(headers)
+            if attempt > 0:
+                req_headers["Connection"] = "close"
             try:
                 async with self.session.get(
                     url,
-                    headers=headers,
+                    headers=req_headers,
                     cookies=req_cookies,
                     timeout=timeout,
                 ) as resp:
@@ -566,7 +569,9 @@ class NgaParser(BaseForumParser):
                         if resp.status in {401, 403}:
                             last_msg = f"HTTP {resp.status} 权限不足或需要登录"
             except Exception as e:
-                last_msg = str(e)
+                last_msg = str(e).strip() or type(e).__name__
+                if attempt == 0:
+                    continue
             break
 
         return None, last_msg
@@ -582,15 +587,18 @@ class NgaParser(BaseForumParser):
             "Content-Type": "application/x-www-form-urlencoded",
             "Cookie": cookie_header,
         }
-        timeout = aiohttp.ClientTimeout(total=15)
+        timeout = aiohttp.ClientTimeout(total=12, connect=4, sock_connect=4, sock_read=8)
         last_msg = ""
 
-        for host in ("https://bbs.nga.cn", "https://ngabbs.com"):
+        for idx, host in enumerate(("https://bbs.nga.cn", "https://ngabbs.com")):
+            req_headers = dict(headers)
+            if idx > 0:
+                req_headers["Connection"] = "close"
             try:
                 async with self.session.post(
                     f"{host}/app_api.php?__lib=post&__act=list",
                     data={"tid": tid, "page": "1"},
-                    headers=headers,
+                    headers=req_headers,
                     timeout=timeout,
                 ) as resp:
                     raw = await read_response_bounded(resp)
@@ -602,7 +610,7 @@ class NgaParser(BaseForumParser):
                         return payload, ""
                     last_msg = str(payload.get("msg") or f"code={code}")
             except Exception as e:
-                last_msg = str(e)
+                last_msg = str(e).strip() or type(e).__name__
                 continue
 
         return None, last_msg

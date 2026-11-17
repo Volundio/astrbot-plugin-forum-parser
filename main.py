@@ -216,7 +216,12 @@ class ForumParserPlugin(Star):
         )
 
         if self._http_session is None or self._http_session.closed:
-            connector = aiohttp.TCPConnector(limit=16, limit_per_host=6)
+            connector = aiohttp.TCPConnector(
+                limit=16,
+                limit_per_host=6,
+                keepalive_timeout=10.0,
+                enable_cleanup_closed=True,
+            )
             self._http_session = aiohttp.ClientSession(trust_env=True, connector=connector)
             self._s1_parser = Stage1stParser(
                 self._http_session,

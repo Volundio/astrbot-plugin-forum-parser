@@ -387,3 +387,115 @@ async def test_s1_banned_author_and_expired_sid_auto_relogin() -> None:
     assert "禁言" in res.invisible_reason or "屏蔽" in res.invisible_reason
     assert "被塞抹布前的真实主楼发言内容" in res.content_html
     assert kv_store["s1_app_sid"] == "renewed_sid_999"
+
+
+@pytest.mark.asyncio
+async def test_s1_cross_border_timeout_retry_and_app_permission_error() -> None:
+    """验证跨境连接 TimeoutError 自动换新连接重试、网页全挂时并发走 App 兜底不误标徽章，以及权限不足清晰报错。"""
+
+    from core.models import ForumParseError
+
+    kv_store: dict[str, object] = {
+        "s1_app_sid": "valid_sid",
+        "s1_app_username": "s1user",
+        "s1_web_cookies": {"B7Y9_2132_auth": "ok"},
+        "s1_web_username": "s1user",
+    }
+
+    async def kv_get(k: str, default: object = None) -> object:
+        return kv_store.get(k, default)
+
+    async def kv_set(k: str, val: object) -> None:
+        kv_store[k] = val
+
+    # 场景 1：网页端连续两次超时，App 接口第 1 次抖动超时、第 2 次换新连接 (Connection: close) 重试成功
+    link1 = ForumLink(
+        forum=ForumType.STAGE1ST,
+        tid="2136103",
+        original_url="https://stage1st.com/2b/thread-2136103-1-1.html",
+        canonical_url="https://stage1st.com/2b/thread-2136103-1-1.html",
+    )
+    mocked1 = MockHttpRouter()
+    mocked1.get("https://stage1st.com/2b/thread-2136103-1-1.html", exc=TimeoutError())
+    mocked1.get("https://stage1st.com/2b/thread-2136103-1-1.html", exc=TimeoutError())
+    mocked1.post("https://app.stage1st.com/2b/api/app/thread", exc=TimeoutError())
+    mocked1.post(
+        "https://app.stage1st.com/2b/api/app/thread",
+        status=200,
+        payload={
+            "code": 200,
+            "data": {"tid": 2136103, "subject": "跨境容灾测试帖", "fname": "漫区"},
+        },
+    )
+    mocked1.post(
+        "https://app.stage1st.com/2b/api/app/thread/page",
+        status=200,
+        payload={
+            "code": 200,
+            "data": {
+                "list": [
+                    {
+                        "pid": 1,
+                        "position": 1,
+                        "author": "漫区楼主",
+                        "authorid": 1001,
+                        "dateline": 1763376200,
+                        "message": "<p>跨境重试后成功拿回的主楼内容</p>",
+                    }
+                ]
+            },
+        },
+    )
+
+    async with aiohttp.ClientSession(middlewares=[mocked1.middleware]) as session:
+        parser = Stage1stParser(
+            session,
+            config={"enabled": True, "username": "s1user", "password": "s1password"},
+            kv_getter=kv_get,
+            kv_setter=kv_set,
+        )
+        res1 = await parser.parse_thread(link1, embed_images=False)
+
+    assert res1.title == "跨境容灾测试帖"
+    assert "跨境重试后成功拿回" in res1.content_html
+    # 纯网页超时走 App 容灾恢复的正常帖，不应误标为“不可见内容”
+    assert res1.is_unblocked_invisible is False
+    # 验证第 2 次重试请求自动带上了 Connection: close 强制换新连接
+    web_reqs = [r for r in mocked1.requests if "thread-2136103" in r[1]]
+    assert len(web_reqs) == 2
+    assert web_reqs[1][2].get("Connection") == "close"
+
+    # 场景 2：不可见帖且 App 接口返回明确业务权限限制（如阅读权限不足），报错应清晰包含 App 返回原因
+    link2 = ForumLink(
+        forum=ForumType.STAGE1ST,
+        tid="2200999",
+        original_url="https://stage1st.com/2b/thread-2200999-1-1.html",
+        canonical_url="https://stage1st.com/2b/thread-2200999-1-1.html",
+    )
+    mocked2 = MockHttpRouter()
+    mocked2.get(
+        "https://stage1st.com/2b/thread-2200999-1-1.html",
+        status=200,
+        body=SAMPLE_S1_MODERATED_HTML.encode("utf-8"),
+    )
+    mocked2.post(
+        "https://app.stage1st.com/2b/api/app/thread",
+        status=200,
+        payload={"code": 403, "message": "本帖要求阅读权限高于 100"},
+    )
+    mocked2.post(
+        "https://app.stage1st.com/2b/api/app/thread/page",
+        status=200,
+        payload={"code": 403, "message": "本帖要求阅读权限高于 100"},
+    )
+
+    async with aiohttp.ClientSession(middlewares=[mocked2.middleware]) as session:
+        parser2 = Stage1stParser(
+            session,
+            config={"enabled": True, "username": "s1user", "password": "s1password"},
+            kv_getter=kv_get,
+            kv_setter=kv_set,
+        )
+        with pytest.raises(ForumParseError) as exc_info:
+            await parser2.parse_thread(link2, embed_images=False)
+        assert "本帖要求阅读权限高于 100" in str(exc_info.value)

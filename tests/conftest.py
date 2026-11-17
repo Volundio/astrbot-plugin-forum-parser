@@ -77,7 +77,9 @@ class MockHttpRouter:
     """兼容 aiohttp 3.14 ClientSession(middlewares=[...]) 的轻量级测试桩路由器。"""
 
     def __init__(self) -> None:
-        self._queues: dict[tuple[str, str], deque[_FakeAiohttpResponse]] = defaultdict(deque)
+        self._queues: dict[tuple[str, str], deque[_FakeAiohttpResponse | BaseException]] = (
+            defaultdict(deque)
+        )
         self.requests: list[tuple[str, str, dict[str, str]]] = []
 
     def add(
@@ -89,7 +91,11 @@ class MockHttpRouter:
         body: bytes | str | None = None,
         payload: Any = None,
         headers: dict[str, str] | None = None,
+        exc: BaseException | None = None,
     ) -> None:
+        if exc is not None:
+            self._queues[(method.upper(), url)].append(exc)
+            return
         hdrs = dict(headers or {})
         if payload is not None:
             raw_body = _json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -116,9 +122,11 @@ class MockHttpRouter:
         self.requests.append((method, url, dict(req.headers)))
         q = self._queues.get((method, url))
         if q:
-            resp = q.popleft() if len(q) > 1 else q[0]
-            resp.url = req.url
-            return resp
+            item = q.popleft() if len(q) > 1 else q[0]
+            if isinstance(item, BaseException):
+                raise item
+            item.url = req.url
+            return item
         err_resp = _FakeAiohttpResponse(status=404, body=f"Unmocked {method} {url}".encode())
         err_resp.url = req.url
         return err_resp

@@ -1,0 +1,46 @@
+# Changelog
+
+All notable changes to `astrbot_plugin_forum_parser` will be documented in this file.
+
+## [v0.1.3] - 2026-11-17
+
+### Added
+- 新增标准插件更新日志文件 `CHANGELOG.md`，适配 AstrBot WebUI 插件更新日志面板展示。
+
+### Improved
+- **跨境直连网络抗抖动优化（香港/海外服务器连接内地源站）**：
+  - 将 Stage1st 与 NGA 请求超时细化为短握手/短读取超时（`connect=4s, sock_read=8s`），遇到跨境晚高峰丢包或陈旧 Keep-Alive 死连接卡住时，自动附带 `Connection: close` 切换全新 TCP 连接快速重试，避免单次死等 15 秒超时。
+  - Stage1st 官方 App 接口 `/thread` 与 `/thread/page` 改为 `asyncio.gather` 并发请求，并将 `pageSize` 从 `40` 精简为 `2`（仅拉取主楼），大幅减小跨境响应包体积与耗时。
+  - 优化 `TCPConnector` 连接池参数（缩短空闲保活时长并启用 `enable_cleanup_closed`）。
+
+### Fixed
+- 修复 `asyncio.TimeoutError` 转字符串为空导致日志中异常原因显示空白的问题。
+- 修复 Stage1st 网页端与 App 接口同时失败时报错文案仅显示网页错误、未展示 App 接口真实错误（如阅读权限不足或接口超时）的问题。
+- 修复仅因网页端网络超时而走 App 接口容灾恢复普通帖子时，卡片顶栏误显示“已解锁不可见内容”徽章的问题。
+
+## [v0.1.2] - 2026-11-17
+
+### Changed
+- **Telegram 无损完整长图推送**：在 Telegram 平台下统一仅推送自定义模板渲染的主楼完整长图，并固定以 `Comp.File`（Send as File / `send_document`）原图文件方式发送，避免 `sendPhoto` 压缩模糊与 `10000px` 尺寸上限。
+- 默认关闭 `enable_length_limit`（超长主楼截断保护）并移除旧的 `9600px` 高度裁剪限制，默认渲染整栋主楼完整长图。
+- **图片体积预算上调**：
+  - 渲染卡片内嵌图片上限上调为 **单图 `5MB`、整帖合计 `10MB`**（改为按原始图片二进制字节精确累计，不受 Base64 编码膨胀影响）。
+  - OneBot v11 合并转发图片上限上调为 **单图 `10MB`、整包本地图片总预算 `50MB`**。
+  - 完整渲染长图流式接收上限同步上调至 `35MB`，临时目录巡检磁盘总配额上调至 `160MB`。
+
+## [v0.1.1] - 2026-11-17
+
+### Fixed
+- **图床与接口旧域名迁移**：将已停用的 NGA 旧图床 `img.nga.178.com` 与 S1 旧域名 `*.saraba1st.com` 自动重写至现役 `img.nga.cn` 与 `*.stage1st.com`。
+- **OneBot v11 合并转发稳定性加固**：合并转发原图节点仅传入本地校验落盘成功的文件路径，源站失效或超限配图自动跳过并附纯文本说明，防止触发 AstrBot `RespondStage` 未捕获的下载异常导致整条转发失败。
+
+## [v0.1.0] - 2026-11-17
+
+### Added
+- 初始版本发布，支持 **OneBot v11 (`aiocqhttp`)** 与 **Telegram (`telegram`)** 平台自动识别并解析论坛帖子主楼：
+  - 支持 **Stage1st (`stage1st.com`)**：支持配置账号密码（含安全提问）登录，参考社区脚本通过官方 App 接口解锁“内容审核中”与“作者被禁止或删除 内容自动屏蔽”不可见内容。
+  - 支持 **NGA (`bbs.nga.cn`)**：支持配置 `ngaPassportUid` + `ngaPassportCid` 或 Cookie，支持 `read.php` 与移动端 `app_api.php` 双通道解析及完整 BBCode 转 HTML 引擎。
+  - 支持提取纯文本链接、同源别名域名、QQ 小程序/JSON 分享卡片及 Telegram `text_link` 超链接实体。
+  - 内置专属多主题 `HTML + Jinja2` 渲染卡片模板（论坛特色自适应 / 现代浅色 / 现代深色），支持自定义远程 `t2i_endpoint`。
+  - OneBot v11 默认使用合并转发一并发送帖子摘要、主楼渲染长图与帖子配图。
+  - 内置流式落盘防 OOM 保护与发送完成即刻清理临时文件机制（零垃圾残留）。

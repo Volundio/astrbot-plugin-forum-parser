@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from datetime import datetime, timedelta, timezone
@@ -68,6 +69,18 @@ WEB_LOGIN_OR_PERM_HINTS = (
 
 UID_IN_HREF_RE = re.compile(r"(?:space-uid-|uid=)(\d+)")
 CHINA_TZ = timezone(timedelta(hours=8))
+
+# 针对跨境（如香港/海外直连内地阿里云源站）优化的短握手/读取超时与重试次数，避免丢包死连接傻等 15 秒
+S1_REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=12, connect=4, sock_connect=4, sock_read=8)
+S1_MAX_ATTEMPTS = 2
+
+
+def format_network_exc(exc: BaseException) -> str:
+    """格式化异常信息，防止 asyncio.TimeoutError 的 str(e) 为空字符串导致日志原因空白。"""
+    msg = str(exc).strip()
+    if isinstance(exc, TimeoutError | asyncio.TimeoutError):
+        return f"连接或读取超时 ({msg})" if msg else "连接或读取超时 (TimeoutError)"
+    return f"{type(exc).__name__}: {msg}" if msg else type(exc).__name__
 
 
 def build_s1_avatar_url(uid: str | int | None) -> str:
@@ -188,34 +201,47 @@ class Stage1stParser(BaseForumParser):
             "User-Agent": DEFAULT_BROWSER_UA,
             "Referer": S1_WEB_BASE,
         }
-        timeout = aiohttp.ClientTimeout(total=15)
-        try:
-            async with self.session.post(
-                S1_MOBILE_LOGIN_URL,
-                data=form,
-                headers=headers,
-                timeout=timeout,
-            ) as resp:
-                cookies: dict[str, str] = {}
-                for k, morsel in resp.cookies.items():
-                    cookies[k] = morsel.value
-                # 兼容从 Set-Cookie 头提取所有键值
-                for raw_sc in resp.headers.getall("Set-Cookie", []):
-                    first_pair = raw_sc.split(";", 1)[0].strip()
-                    if "=" in first_pair:
-                        ck, cv = first_pair.split("=", 1)
-                        cookies[ck.strip()] = cv.strip()
+        last_err = ""
+        for attempt in range(S1_MAX_ATTEMPTS):
+            req_headers = dict(headers)
+            if attempt > 0:
+                req_headers["Connection"] = "close"
+            try:
+                async with self.session.post(
+                    S1_MOBILE_LOGIN_URL,
+                    data=form,
+                    headers=req_headers,
+                    timeout=S1_REQUEST_TIMEOUT,
+                ) as resp:
+                    cookies: dict[str, str] = {}
+                    for k, morsel in resp.cookies.items():
+                        cookies[k] = morsel.value
+                    # 兼容从 Set-Cookie 头提取所有键值
+                    for raw_sc in resp.headers.getall("Set-Cookie", []):
+                        first_pair = raw_sc.split(";", 1)[0].strip()
+                        if "=" in first_pair:
+                            ck, cv = first_pair.split("=", 1)
+                            cookies[ck.strip()] = cv.strip()
 
-                body_text = await resp.text(errors="replace")
-                if cookies and ("login_succeed" in body_text or any("auth" in k for k in cookies)):
-                    self._mem_web_cookies = cookies
-                    await self.set_state(self.KV_WEB_USER, self._username)
-                    await self.set_state(self.KV_WEB_COOKIES, cookies)
-                    logger.info("Stage1st 网页会话登录成功。")
-                    return dict(cookies)
-                logger.warning("Stage1st 网页登录未返回有效鉴权 Cookie。")
-        except Exception as e:
-            logger.warning(f"Stage1st 网页登录请求异常: {e}")
+                    body_text = await resp.text(errors="replace")
+                    if cookies and (
+                        "login_succeed" in body_text or any("auth" in k for k in cookies)
+                    ):
+                        self._mem_web_cookies = cookies
+                        await self.set_state(self.KV_WEB_USER, self._username)
+                        await self.set_state(self.KV_WEB_COOKIES, cookies)
+                        logger.info("Stage1st 网页会话登录成功。")
+                        return dict(cookies)
+                    logger.warning("Stage1st 网页登录未返回有效鉴权 Cookie。")
+                    return {}
+            except Exception as e:
+                last_err = format_network_exc(e)
+                if attempt + 1 < S1_MAX_ATTEMPTS:
+                    logger.debug(
+                        f"Stage1st 网页登录第 {attempt + 1} 次超时/异常，正在换新连接重试: {last_err}"
+                    )
+                    continue
+        logger.warning(f"Stage1st 网页登录请求失败: {last_err}")
         return {}
 
     async def _get_app_sid(self, *, force_relogin: bool = False) -> str:
@@ -257,34 +283,41 @@ class Stage1stParser(BaseForumParser):
             "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
             "User-Agent": DEFAULT_BROWSER_UA,
         }
-        timeout = aiohttp.ClientTimeout(total=15)
         last_err: str = ""
 
         for api_base in S1_APP_API_BASES:
-            try:
-                async with self.session.post(
-                    f"{api_base}/user/login",
-                    data=form,
-                    headers=headers,
-                    timeout=timeout,
-                ) as resp:
-                    if resp.status != 200:
-                        last_err = f"HTTP {resp.status}"
+            for attempt in range(S1_MAX_ATTEMPTS):
+                req_headers = dict(headers)
+                if attempt > 0:
+                    req_headers["Connection"] = "close"
+                try:
+                    async with self.session.post(
+                        f"{api_base}/user/login",
+                        data=form,
+                        headers=req_headers,
+                        timeout=S1_REQUEST_TIMEOUT,
+                    ) as resp:
+                        if resp.status != 200:
+                            last_err = f"HTTP {resp.status}"
+                            continue
+                        payload = await resp.json(content_type=None)
+                        code = str(payload.get("code") or "")
+                        sid = (payload.get("data") or {}).get("sid")
+                        if code and not code.startswith("50") and sid:
+                            self._mem_app_sid = str(sid)
+                            await self.set_state(self.KV_APP_USER, self._username)
+                            await self.set_state(self.KV_APP_SID, self._mem_app_sid)
+                            logger.info("Stage1st 官方 App 接口登录成功，已缓存 sid。")
+                            return self._mem_app_sid
+                        last_err = str(payload.get("message") or f"code={code}")
+                        break
+                except Exception as e:
+                    last_err = format_network_exc(e)
+                    if attempt + 1 < S1_MAX_ATTEMPTS:
+                        logger.debug(
+                            f"Stage1st App 登录第 {attempt + 1} 次超时/异常，正在换新连接重试: {last_err}"
+                        )
                         continue
-                    payload = await resp.json(content_type=None)
-                    code = str(payload.get("code") or "")
-                    sid = (payload.get("data") or {}).get("sid")
-                    if code and not code.startswith("50") and sid:
-                        self._mem_app_sid = str(sid)
-                        await self.set_state(self.KV_APP_USER, self._username)
-                        await self.set_state(self.KV_APP_SID, self._mem_app_sid)
-                        logger.info("Stage1st 官方 App 接口登录成功，已缓存 sid。")
-                        return self._mem_app_sid
-                    last_err = str(payload.get("message") or f"code={code}")
-                    break
-            except Exception as e:
-                last_err = str(e)
-                continue
 
         logger.warning(f"Stage1st 官方 App 接口登录失败: {last_err}")
         return ""
@@ -294,11 +327,11 @@ class Stage1stParser(BaseForumParser):
         route: str,
         params: dict[str, str],
         sid: str,
-    ) -> tuple[dict[str, Any] | None, bool]:
-        """请求 S1 官方 App 接口路由。
+    ) -> tuple[dict[str, Any] | None, bool, str]:
+        """请求 S1 官方 App 接口路由（支持跨境丢包快速断连换新连接重试）。
 
         Returns:
-            (data_dict, is_login_invalid)
+            (data_dict, is_login_invalid, error_message)
         """
         req_data = dict(params)
         if sid:
@@ -311,49 +344,69 @@ class Stage1stParser(BaseForumParser):
         if sid:
             headers["authorization"] = sid
 
-        timeout = aiohttp.ClientTimeout(total=15)
+        last_err = ""
+        clean_route = route.lstrip("/")
         for api_base in S1_APP_API_BASES:
-            try:
-                async with self.session.post(
-                    f"{api_base}/{route.lstrip('/')}",
-                    data=req_data,
-                    headers=headers,
-                    timeout=timeout,
-                ) as resp:
-                    if resp.status != 200:
+            for attempt in range(S1_MAX_ATTEMPTS):
+                req_headers = dict(headers)
+                if attempt > 0:
+                    req_headers["Connection"] = "close"
+                try:
+                    async with self.session.post(
+                        f"{api_base}/{clean_route}",
+                        data=req_data,
+                        headers=req_headers,
+                        timeout=S1_REQUEST_TIMEOUT,
+                    ) as resp:
+                        if resp.status != 200:
+                            last_err = f"HTTP {resp.status}"
+                            continue
+                        payload = await resp.json(content_type=None)
+                        if not isinstance(payload, dict):
+                            last_err = "响应格式非预期 JSON"
+                            continue
+                        code = str(payload.get("code") or "")
+                        msg = str(payload.get("message") or "").strip()
+                        if code.startswith("50") or "重新登录" in msg or msg.startswith("请先登录"):
+                            return None, True, (msg or f"登录态失效(code={code})")
+                        data = payload.get("data")
+                        if isinstance(data, dict):
+                            return data, False, ""
+                        return None, False, (msg or (f"code={code}" if code else "无可见数据"))
+                except Exception as e:
+                    last_err = format_network_exc(e)
+                    if attempt + 1 < S1_MAX_ATTEMPTS:
+                        logger.debug(
+                            f"S1 App 接口 /{clean_route} 第 {attempt + 1} 次异常，换新连接重试: {last_err}"
+                        )
                         continue
-                    payload = await resp.json(content_type=None)
-                    if not isinstance(payload, dict):
-                        continue
-                    code = str(payload.get("code") or "")
-                    msg = str(payload.get("message") or "")
-                    if code.startswith("50") or "重新登录" in msg or msg.startswith("请先登录"):
-                        return None, True
-                    data = payload.get("data")
-                    if isinstance(data, dict):
-                        return data, False
-                    return None, False
-            except Exception as e:
-                logger.debug(f"S1 App 接口 {api_base}/{route} 请求异常: {e}")
-                continue
-        return None, False
+            if last_err:
+                logger.warning(
+                    f"Stage1st App 接口 /{clean_route} 请求失败 (tid={params.get('tid', '')}): {last_err}"
+                )
+        return None, False, (f"App 接口请求失败（{last_err}）" if last_err else "App 接口无响应")
 
     async def _fetch_via_app_api(
         self, tid: str
-    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-        """通过 S1 官方 App 接口获取主题元信息 (/thread) 与第一页楼层 (/thread/page)。
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None, str]:
+        """通过 S1 官方 App 接口并发获取主题元信息 (/thread) 与主楼 (/thread/page, pageSize=2)。
 
-        当检测到 sid 失效（50x 状态码）时自动重新登录并重试一次。
+        仅拉取前 2 条楼层以大幅缩减跨境数据包体积，并在检测到 sid 失效（50x 状态码）时自动重登重试。
         """
+        logger.info(f"Stage1st 正在通过官方 App 接口获取帖子主楼 (tid={tid})...")
         sid = await self._get_app_sid(force_relogin=False)
+        last_err = ""
 
         for attempt in range(2):
-            thread_info, invalid_1 = await self._post_app_endpoint("thread", {"tid": tid}, sid)
-            page_data, invalid_2 = await self._post_app_endpoint(
-                "thread/page",
-                {"tid": tid, "pageNo": "1", "pageSize": "40"},
-                sid,
+            (thread_info, invalid_1, err_1), (page_data, invalid_2, err_2) = await asyncio.gather(
+                self._post_app_endpoint("thread", {"tid": tid}, sid),
+                self._post_app_endpoint(
+                    "thread/page",
+                    {"tid": tid, "pageNo": "1", "pageSize": "2"},
+                    sid,
+                ),
             )
+            last_err = err_2 or err_1
 
             if (invalid_1 or invalid_2) and attempt == 0:
                 logger.info("Stage1st App sid 失效或为空，尝试自动登录刷新 sid...")
@@ -363,6 +416,7 @@ class Stage1stParser(BaseForumParser):
                 if new_sid:
                     sid = new_sid
                     continue
+                last_err = "App 接口登录获取 sid 失败"
                 break
 
             post_list = (page_data or {}).get("list") if isinstance(page_data, dict) else None
@@ -381,12 +435,12 @@ class Stage1stParser(BaseForumParser):
                     main_post = post_list[0]
 
             if thread_info or main_post:
-                return thread_info, main_post
+                return thread_info, main_post, last_err
             break
 
-        return None, None
+        return None, None, (last_err or "未获取到主楼内容")
 
-    async def _fetch_web_page(self, tid: str, cookies: dict[str, str]) -> str | None:
+    async def _fetch_web_page(self, tid: str, cookies: dict[str, str]) -> tuple[str | None, str]:
         url = f"{S1_WEB_BASE}thread-{tid}-1-1.html"
         headers = {
             "User-Agent": DEFAULT_BROWSER_UA,
@@ -394,21 +448,34 @@ class Stage1stParser(BaseForumParser):
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             "Referer": S1_WEB_BASE,
         }
-        timeout = aiohttp.ClientTimeout(total=15)
-        try:
-            async with self.session.get(
-                url,
-                headers=headers,
-                cookies=cookies or None,
-                timeout=timeout,
-            ) as resp:
-                if resp.status != 200:
-                    return None
-                raw_bytes = await read_response_bounded(resp)
-                return raw_bytes.decode("utf-8", errors="replace")
-        except Exception as e:
-            logger.warning(f"Stage1st 网页请求异常 (tid={tid}): {e}")
-            return None
+        last_err = ""
+        for attempt in range(S1_MAX_ATTEMPTS):
+            req_headers = dict(headers)
+            if attempt > 0:
+                req_headers["Connection"] = "close"
+            try:
+                async with self.session.get(
+                    url,
+                    headers=req_headers,
+                    cookies=cookies or None,
+                    timeout=S1_REQUEST_TIMEOUT,
+                ) as resp:
+                    if resp.status != 200:
+                        last_err = f"HTTP {resp.status}"
+                        if resp.status >= 500 and attempt + 1 < S1_MAX_ATTEMPTS:
+                            continue
+                        break
+                    raw_bytes = await read_response_bounded(resp)
+                    return raw_bytes.decode("utf-8", errors="replace"), ""
+            except Exception as e:
+                last_err = format_network_exc(e)
+                if attempt + 1 < S1_MAX_ATTEMPTS:
+                    logger.debug(
+                        f"Stage1st 网页请求第 {attempt + 1} 次异常 (tid={tid})，换新连接重试: {last_err}"
+                    )
+                    continue
+        logger.warning(f"Stage1st 网页请求失败 (tid={tid}): {last_err}")
+        return None, f"网页请求失败（{last_err or '未知错误'}）"
 
     @staticmethod
     def _extract_web_metadata(doc: MiniNode) -> dict[str, Any]:
@@ -640,16 +707,17 @@ class Stage1stParser(BaseForumParser):
         if not web_cookies and self._has_credentials():
             web_cookies = await self._login_web_session()
 
-        html_text = await self._fetch_web_page(tid, web_cookies)
+        html_text, web_err = await self._fetch_web_page(tid, web_cookies)
         doc = parse_html(html_text) if html_text else None
         web_meta = self._extract_web_metadata(doc) if doc else {}
         first_post_div, block_reason = (
-            self._extract_web_first_post(doc) if doc else (None, "网页请求失败")
+            self._extract_web_first_post(doc) if doc else (None, web_err or "网页请求失败")
         )
 
         # 若因未登录受限且配置了账号密码但此前使用的是缓存旧 Cookie，尝试刷新一次网页登录
         if (
-            block_reason
+            doc is not None
+            and block_reason
             and any(h in block_reason for h in WEB_LOGIN_OR_PERM_HINTS)
             and self._has_credentials()
             and not str(self.cfg.get("cookie") or "").strip()
@@ -657,12 +725,13 @@ class Stage1stParser(BaseForumParser):
             fresh_cookies = await self._login_web_session()
             if fresh_cookies:
                 web_cookies = fresh_cookies
-                html_text = await self._fetch_web_page(tid, web_cookies)
+                html_text, web_err = await self._fetch_web_page(tid, web_cookies)
                 if html_text:
                     doc = parse_html(html_text)
                     web_meta = self._extract_web_metadata(doc)
                     first_post_div, block_reason = self._extract_web_first_post(doc)
 
+        is_web_network_failure = html_text is None
         need_app_unblock = first_post_div is None or bool(block_reason)
         is_unblocked_invisible = False
         invisible_reason = ""
@@ -702,23 +771,25 @@ class Stage1stParser(BaseForumParser):
             rate_summary = details["rate_summary"]
             rates = details["rates"]
 
-        # 当主楼不可见（审核中 / 禁言屏蔽 / 权限限制）时，调用 S1 官方 App API 解锁
+        # 当主楼不可见（审核中 / 禁言屏蔽 / 权限限制）或网页端请求超时时，调用 S1 官方 App API 解锁/兜底
         if need_app_unblock:
-            if not self._enable_invisible_parse:
+            if not self._enable_invisible_parse and not is_web_network_failure:
                 raise ForumParseError(
                     f"Stage1st 帖子主楼当前不可见（{block_reason or '受限'}），且未开启不可见内容解析。"
                 )
 
-            app_thread, app_post = await self._fetch_via_app_api(tid)
+            app_thread, app_post, app_err = await self._fetch_via_app_api(tid)
             if app_post and app_post.get("message"):
                 raw_post_html = str(app_post.get("message") or "")
-                is_unblocked_invisible = True
-                if "审核" in (block_reason or ""):
-                    invisible_reason = "内容审核中"
-                elif "禁止或删除" in (block_reason or "") or "屏蔽" in (block_reason or ""):
-                    invisible_reason = "作者被禁言/内容屏蔽"
-                else:
-                    invisible_reason = block_reason or "不可见/受限内容"
+                # 若仅因网页网络超时走 App 兜底成功，不误标“不可见内容”徽章；仅在网页确有屏蔽/审核提示时标注
+                if not is_web_network_failure:
+                    is_unblocked_invisible = True
+                    if "审核" in (block_reason or ""):
+                        invisible_reason = "内容审核中"
+                    elif "禁止或删除" in (block_reason or "") or "屏蔽" in (block_reason or ""):
+                        invisible_reason = "作者被禁言/内容屏蔽"
+                    else:
+                        invisible_reason = block_reason or "不可见/受限内容"
 
                 if app_thread:
                     title = title or str(app_thread.get("subject") or "")
@@ -749,9 +820,16 @@ class Stage1stParser(BaseForumParser):
                     raise ForumLoginRequiredError(
                         f"Stage1st 帖子不可见（{block_reason or '审核中/需要权限'}），请在插件设置中配置 Stage1st 账号密码以通过 App 接口解锁。"
                     )
-                raise ForumParseError(
-                    f"无法解析 Stage1st 帖子 (tid={tid})：{block_reason or '帖子不存在或已彻底删除'}"
-                )
+                reason_parts: list[str] = []
+                if block_reason:
+                    reason_parts.append(block_reason)
+                if app_err and app_err not in (block_reason or ""):
+                    if app_err.startswith("App 接口"):
+                        reason_parts.append(app_err)
+                    else:
+                        reason_parts.append(f"App 接口返回：{app_err}")
+                combined_reason = "；".join(reason_parts) or "帖子不存在或已彻底删除"
+                raise ForumParseError(f"无法解析 Stage1st 帖子 (tid={tid})：{combined_reason}")
 
         if not title:
             title = f"Stage1st 主题 #{tid}"

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import json
 import re
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
@@ -31,6 +33,7 @@ from ..temp_manager import TempScope
 from .base import DEFAULT_BROWSER_UA, BaseForumParser, parse_cookie_string
 
 S1_WEB_BASE = "https://stage1st.com/2b/"
+S1_MOBILE_LOGIN_INIT_URL = "https://stage1st.com/2b/api/mobile/index.php?version=4&module=login"
 S1_MOBILE_LOGIN_URL = (
     "https://stage1st.com/2b/api/mobile/index.php"
     "?version=4&module=login&loginsubmit=yes&loginfield=auto&cookietime=2592000"
@@ -151,6 +154,67 @@ def _format_s1_floor_label(
     return (f"楼主 · {cleaned}" if is_thread_author else cleaned), False
 
 
+def _clean_s1_cookies(raw: dict[str, Any] | None) -> dict[str, str]:
+    """清理无效或已注销占位的 Stage1st Cookie（如 `*_invite_auth=deleted`）。"""
+    if not isinstance(raw, dict):
+        return {}
+    cleaned: dict[str, str] = {}
+    for k, v in raw.items():
+        ck = str(k).strip()
+        cv = str(v).strip()
+        if ck and cv and cv.lower() != "deleted":
+            cleaned[ck] = cv
+    return cleaned
+
+
+def _has_valid_s1_auth_cookie(cookies: dict[str, str]) -> bool:
+    """严格判断 Cookie 字典中是否包含真实已登录凭据 `*_auth`（排除 `_invite_auth`）。"""
+    return any(
+        k.lower().endswith("_auth") and not k.lower().endswith("_invite_auth")
+        for k in _clean_s1_cookies(cookies)
+    )
+
+
+def _extract_response_cookies(resp: aiohttp.ClientResponse) -> tuple[dict[str, str], set[str]]:
+    """从 Set-Cookie 头提取有效 Cookie 键值对与显式清除列表。"""
+    added: dict[str, str] = {}
+    deleted: set[str] = set()
+    for k, morsel in resp.cookies.items():
+        ck = str(k).strip()
+        cv = str(morsel.value or "").strip()
+        if not ck:
+            continue
+        if cv.lower() == "deleted":
+            deleted.add(ck)
+        elif cv:
+            added[ck] = cv
+    for raw_sc in resp.headers.getall("Set-Cookie", []):
+        parts = [p.strip() for p in raw_sc.split(";")]
+        first_pair = parts[0] if parts else ""
+        if "=" not in first_pair:
+            continue
+        ck, cv = first_pair.split("=", 1)
+        ck = ck.strip()
+        cv = cv.strip()
+        is_deleted = (
+            cv.lower() == "deleted"
+            or not cv
+            or any(
+                p.lower().startswith("max-age=0") or "1970" in p.lower()
+                for p in parts[1:]
+                if p.lower().startswith(("max-age=", "expires="))
+            )
+        )
+        if is_deleted:
+            if ck:
+                deleted.add(ck)
+                added.pop(ck, None)
+        elif ck:
+            deleted.discard(ck)
+            added[ck] = cv
+    return added, deleted
+
+
 def format_timestamp_cn(ts: int | float | str | None) -> str:
     """将 Unix 秒或毫秒时间戳格式化为东八区时间字符串。"""
     if ts is None or ts == "":
@@ -221,13 +285,16 @@ class Stage1stParser(BaseForumParser):
         return bool(self._username and self._password)
 
     async def _get_web_cookies(self) -> dict[str, str]:
-        """获取网页端请求可用的 Cookie。"""
+        """获取网页端请求可用的有效 Cookie（自动剔除遗留的假阳性未登录态）。"""
         manual_cookie = str(self.cfg.get("cookie") or "").strip()
         if manual_cookie:
-            return parse_cookie_string(manual_cookie)
+            return _clean_s1_cookies(parse_cookie_string(manual_cookie))
 
         if self._mem_web_cookies:
-            return dict(self._mem_web_cookies)
+            cleaned_mem = _clean_s1_cookies(self._mem_web_cookies)
+            if _has_valid_s1_auth_cookie(cleaned_mem):
+                return cleaned_mem
+            self._mem_web_cookies = {}
 
         saved_user = await self.get_state(self.KV_WEB_USER, "")
         saved_cookies = await self.get_state(self.KV_WEB_COOKIES, None)
@@ -236,19 +303,48 @@ class Stage1stParser(BaseForumParser):
             and saved_cookies
             and (not self._username or saved_user == self._username)
         ):
-            self._mem_web_cookies = {str(k): str(v) for k, v in saved_cookies.items()}
-            return dict(self._mem_web_cookies)
+            cleaned_saved = _clean_s1_cookies(saved_cookies)
+            if _has_valid_s1_auth_cookie(cleaned_saved):
+                self._mem_web_cookies = cleaned_saved
+                return dict(self._mem_web_cookies)
+            # 清除早期版本误存的不含真实 *_auth 的失效 Cookie
+            await self.set_state(self.KV_WEB_COOKIES, {})
         return {}
 
     async def _login_web_session(self) -> dict[str, str]:
-        """使用账号密码登录 Stage1st 网页/移动端会话并缓存 Cookie。"""
+        """按 Discuz Mobile v4 规范两步登录 Stage1st 网页会话并持久化真实鉴权 Cookie。"""
         if not self._has_credentials():
             return {}
+
+        # 1. 先预拉 module=login 取得当前会话 saltkey 与表单验证串 formhash
+        init_cookies: dict[str, str] = {}
+        formhash = ""
+        try:
+            async with self.session.get(
+                S1_MOBILE_LOGIN_INIT_URL,
+                headers={"User-Agent": DEFAULT_BROWSER_UA, "Referer": S1_WEB_BASE},
+                timeout=S1_REQUEST_TIMEOUT,
+            ) as init_resp:
+                added_i, _ = _extract_response_cookies(init_resp)
+                init_cookies.update(added_i)
+                if init_resp.status == 200:
+                    with contextlib.suppress(Exception):
+                        init_json = await init_resp.json(content_type=None)
+                        if isinstance(init_json, dict):
+                            vars_obj = init_json.get("Variables")
+                            if isinstance(vars_obj, dict):
+                                formhash = str(vars_obj.get("formhash") or "").strip()
+        except Exception as init_err:
+            logger.debug(f"Stage1st 预取登录 formhash 失败，将直接提交登录: {init_err}")
 
         form: dict[str, str] = {
             "username": self._username,
             "password": self._password,
+            "fastloginfield": "username",
+            "cookietime": "2592000",
         }
+        if formhash:
+            form["formhash"] = formhash
         if self._question_id > 0:
             form["questionid"] = str(self._question_id)
             form["answer"] = self._answer
@@ -257,6 +353,9 @@ class Stage1stParser(BaseForumParser):
             "User-Agent": DEFAULT_BROWSER_UA,
             "Referer": S1_WEB_BASE,
         }
+        if init_cookies:
+            headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in init_cookies.items())
+
         last_err = ""
         for attempt in range(S1_MAX_ATTEMPTS):
             req_headers = dict(headers)
@@ -269,26 +368,39 @@ class Stage1stParser(BaseForumParser):
                     headers=req_headers,
                     timeout=S1_REQUEST_TIMEOUT,
                 ) as resp:
-                    cookies: dict[str, str] = {}
-                    for k, morsel in resp.cookies.items():
-                        cookies[k] = morsel.value
-                    # 兼容从 Set-Cookie 头提取所有键值
-                    for raw_sc in resp.headers.getall("Set-Cookie", []):
-                        first_pair = raw_sc.split(";", 1)[0].strip()
-                        if "=" in first_pair:
-                            ck, cv = first_pair.split("=", 1)
-                            cookies[ck.strip()] = cv.strip()
+                    post_cookies, deleted_keys = _extract_response_cookies(resp)
+                    cookies = {k: v for k, v in init_cookies.items() if k not in deleted_keys}
+                    cookies.update(post_cookies)
+                    cookies = _clean_s1_cookies(cookies)
 
                     body_text = await resp.text(errors="replace")
                     if cookies and (
-                        "login_succeed" in body_text or any("auth" in k for k in cookies)
+                        _has_valid_s1_auth_cookie(cookies)
+                        or (
+                            "login_succeed" in body_text
+                            and "login_invalid" not in body_text
+                            and len(cookies) > 0
+                        )
                     ):
                         self._mem_web_cookies = cookies
                         await self.set_state(self.KV_WEB_USER, self._username)
                         await self.set_state(self.KV_WEB_COOKIES, cookies)
                         logger.info("Stage1st 网页会话登录成功。")
                         return dict(cookies)
-                    logger.warning("Stage1st 网页登录未返回有效鉴权 Cookie。")
+
+                    last_msg = ""
+                    with contextlib.suppress(Exception):
+                        parsed_body = json.loads(body_text)
+                        if isinstance(parsed_body, dict):
+                            msg_obj = parsed_body.get("Message")
+                            if isinstance(msg_obj, dict):
+                                last_msg = str(
+                                    msg_obj.get("messagestr") or msg_obj.get("messageval") or ""
+                                )
+                    logger.warning(
+                        f"Stage1st 网页登录未返回有效鉴权 Cookie"
+                        f"{f' ({last_msg})' if last_msg else ''}。"
+                    )
                     return {}
             except Exception as e:
                 last_err = format_network_exc(e)
@@ -575,6 +687,9 @@ class Stage1stParser(BaseForumParser):
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
             "Referer": S1_WEB_BASE,
         }
+        clean_cookies = _clean_s1_cookies(cookies)
+        if clean_cookies:
+            headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in clean_cookies.items())
         last_err = ""
         resolved_tid = tid
         resolved_page = max(1, page)
@@ -587,7 +702,6 @@ class Stage1stParser(BaseForumParser):
                 async with self.session.get(
                     url,
                     headers=req_headers,
-                    cookies=cookies or None,
                     timeout=S1_REQUEST_TIMEOUT,
                     allow_redirects=True,
                 ) as resp:
@@ -596,6 +710,10 @@ class Stage1stParser(BaseForumParser):
                         resolved_tid = r_tid
                     if r_page > 1 or not pid:
                         resolved_page = r_page
+
+                    added_ck, _ = _extract_response_cookies(resp)
+                    if added_ck:
+                        cookies.update(added_ck)
 
                     if resp.status != 200:
                         last_err = f"HTTP {resp.status}"
@@ -897,13 +1015,20 @@ class Stage1stParser(BaseForumParser):
         max_content_chars: int = 15000,
         temp_scope: TempScope | None = None,
         rehost_oversize_fn: Callable[[Path, str], Awaitable[str | None]] | None = None,
+        max_inline_single_bytes: int | None = None,
+        max_inline_total_bytes: int | None = None,
+        max_download_single_bytes: int | None = None,
+        max_download_total_bytes: int | None = None,
     ) -> ParsedThread:
         tid = link.tid
         target_pid = link.pid
+        manual_cookie_cfg = str(self.cfg.get("cookie") or "").strip()
+        did_fresh_web_login = False
 
         web_cookies = await self._get_web_cookies()
         if not web_cookies and self._has_credentials():
             web_cookies = await self._login_web_session()
+            did_fresh_web_login = True
 
         html_text, web_err, resolved_tid, resolved_page = await self._fetch_web_page(
             tid,
@@ -925,15 +1050,21 @@ class Stage1stParser(BaseForumParser):
             else (None, web_err or "网页请求失败")
         )
 
-        # 若因未登录受限且配置了账号密码但此前使用的是缓存旧 Cookie，尝试刷新一次网页登录
+        # 若因未登录受限（或帖子出现 attach_nopermission 登录可见附件提示）且配置了账号密码，尝试刷新一次网页登录
+        has_attach_noperm = bool(html_text and "attach_nopermission" in html_text)
+        needs_web_relogin = bool(
+            (block_reason and any(h in block_reason for h in WEB_LOGIN_OR_PERM_HINTS))
+            or has_attach_noperm
+        )
         if (
             doc is not None
-            and block_reason
-            and any(h in block_reason for h in WEB_LOGIN_OR_PERM_HINTS)
+            and needs_web_relogin
+            and not did_fresh_web_login
             and self._has_credentials()
-            and not str(self.cfg.get("cookie") or "").strip()
+            and not manual_cookie_cfg
         ):
             fresh_cookies = await self._login_web_session()
+            did_fresh_web_login = True
             if fresh_cookies:
                 web_cookies = fresh_cookies
                 html_text, web_err, resolved_tid, resolved_page = await self._fetch_web_page(
@@ -1097,6 +1228,16 @@ class Stage1stParser(BaseForumParser):
         post_image_urls: list[str] = []
         pre_downloaded_files: dict[int, str] = {}
         uninlined_flags: list[bool] = []
+        size_kwargs: dict[str, int] = {}
+        if max_inline_single_bytes is not None:
+            size_kwargs["max_inline_single_bytes"] = max_inline_single_bytes
+        if max_inline_total_bytes is not None:
+            size_kwargs["max_inline_total_bytes"] = max_inline_total_bytes
+        if max_download_single_bytes is not None:
+            size_kwargs["max_download_single_bytes"] = max_download_single_bytes
+        if max_download_total_bytes is not None:
+            size_kwargs["max_download_total_bytes"] = max_download_total_bytes
+
         clean_html, is_truncated, char_count, omitted_imgs = await process_post_html(
             raw_post_html,
             base_url=S1_WEB_BASE,
@@ -1114,7 +1255,45 @@ class Stage1stParser(BaseForumParser):
             rehost_oversize_fn=rehost_oversize_fn,
             out_downloaded_files=pre_downloaded_files,
             out_has_uninlined_images=uninlined_flags,
+            **size_kwargs,
         )
+
+        # 若缓存 Cookie 过期导致站内附件图返回 403 等未能内联，立即重新登录刷新 Cookie 并重试一轮
+        if (
+            uninlined_flags
+            and embed_images
+            and prefetch_data_uri
+            and not did_fresh_web_login
+            and not manual_cookie_cfg
+            and self._has_credentials()
+            and ("stage1st.com" in raw_post_html or "saraba1st.com" in raw_post_html)
+        ):
+            fresh_cookies = await self._login_web_session()
+            did_fresh_web_login = True
+            if fresh_cookies:
+                web_cookies = fresh_cookies
+                post_image_urls.clear()
+                pre_downloaded_files.clear()
+                uninlined_flags.clear()
+                clean_html, is_truncated, char_count, omitted_imgs = await process_post_html(
+                    raw_post_html,
+                    base_url=S1_WEB_BASE,
+                    referer=canonical_url,
+                    session=self.session,
+                    cookies=web_cookies,
+                    same_site_hosts=S1_SAME_SITE_HOSTS,
+                    embed_images=embed_images,
+                    prefetch_data_uri=prefetch_data_uri,
+                    max_inline_images=max_inline_images,
+                    enable_length_limit=enable_length_limit,
+                    max_content_chars=max_content_chars,
+                    out_post_image_urls=post_image_urls,
+                    temp_scope=temp_scope,
+                    rehost_oversize_fn=rehost_oversize_fn,
+                    out_downloaded_files=pre_downloaded_files,
+                    out_has_uninlined_images=uninlined_flags,
+                    **size_kwargs,
+                )
 
         # 预下载发言人头像为 Data URI 防止远端渲染器无法加载防盗链头像
         author_avatar = rewrite_legacy_media_url(author_avatar)

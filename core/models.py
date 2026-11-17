@@ -120,6 +120,7 @@ class ParsedThread:
     related_subjects: list[RelatedSubject] = field(default_factory=list)
     pre_downloaded_files: dict[int, str] = field(default_factory=dict)
     has_uninlined_images: bool = False
+    bmo_script_html: str = ""
 
     @property
     def display_floor_badge(self) -> str:

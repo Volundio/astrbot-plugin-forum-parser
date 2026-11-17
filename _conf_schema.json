@@ -80,7 +80,7 @@
       "embed_images": {
         "type": "bool",
         "description": "渲染主楼内嵌图片",
-        "hint": "开启后将自动预下载主楼图片（携带论坛登录态与防盗链请求头，单图上限 6MB、整帖合计上限 12MB；6MB~10MB 防盗链大图自动转存图床）并内嵌到渲染卡片中。",
+        "hint": "开启后将自动预下载主楼图片（携带论坛登录态与防盗链请求头；处于下方单图/总预算内的图片将内嵌至卡片，超出内嵌预算但位于下载上限内的防盗链大图自动转存图床）。",
         "default": true
       },
       "max_inline_images": {
@@ -88,6 +88,39 @@
         "description": "主楼最多内嵌图片数量",
         "hint": "超出数量的图片将转为文字占位提示，防止极端多图帖导致渲染超时。",
         "default": 15
+      },
+      "max_inline_single_mb": {
+        "type": "int",
+        "description": "卡片内嵌单张图片大小上限 (MB)",
+        "hint": "体积不超过此上限的配图直接以 Base64 Data URI 内嵌到渲染卡片中；超出内嵌上限但在下载上限内的防盗链大图将自动转存图床以供远程渲染服务加载。",
+        "default": 6,
+        "slider": {
+          "min": 1,
+          "max": 30,
+          "step": 1
+        }
+      },
+      "max_inline_total_mb": {
+        "type": "int",
+        "description": "卡片内嵌图片总大小上限 (MB)",
+        "hint": "单张卡片累计内嵌的原始图片总字节上限，避免超多大图内嵌时内存占用过高或超出远程 T2I 服务请求体限制。",
+        "default": 12,
+        "slider": {
+          "min": 2,
+          "max": 60,
+          "step": 2
+        }
+      },
+      "max_rendered_card_mb": {
+        "type": "int",
+        "description": "单张渲染长图体积上限 (MB)",
+        "hint": "QQ NT / OneBot 高速上传通道（Highway cmdId=1004）会拒绝发送超过约 18~20MB 的单张长图（error_code=921）；超过此阈值时将自动降级画质/缩放重绘或启用分页截断。",
+        "default": 15,
+        "slider": {
+          "min": 3,
+          "max": 40,
+          "step": 1
+        }
       },
       "enable_length_limit": {
         "type": "bool",
@@ -194,6 +227,28 @@
           "max": 50,
           "step": 1
         }
+      },
+      "upload_max_single_image_mb": {
+        "type": "int",
+        "description": "Telegraph 单张配图上传大小上限 (MB)",
+        "hint": "单张帖子配图允许下载并转存至图床的最大体积，超限图片将略过上传以防内存与耗时过高。",
+        "default": 10,
+        "slider": {
+          "min": 1,
+          "max": 30,
+          "step": 1
+        }
+      },
+      "upload_max_total_images_mb": {
+        "type": "int",
+        "description": "Telegraph 整帖配图上传总大小上限 (MB)",
+        "hint": "单篇帖子转存至图床的累计图片体积上限。",
+        "default": 50,
+        "slider": {
+          "min": 5,
+          "max": 150,
+          "step": 5
+        }
       }
     }
   },
@@ -210,7 +265,7 @@
       "forward_include_images": {
         "type": "bool",
         "description": "合并转发中一并发送帖子内原图",
-        "hint": "当帖子主楼包含图片（含动图 GIF）时，在合并转发消息中附带发送原图节点（单图上限 10MB、单次合并转发本地图片总预算 50MB），方便单独点开查看或保存。",
+        "hint": "当帖子主楼包含图片（含动图 GIF）时，在合并转发消息中附带发送原图节点（可在下方自由调整单图与总体积上限），方便单独点开查看或保存。",
         "default": true
       },
       "forward_max_images": {
@@ -221,6 +276,28 @@
           "min": 1,
           "max": 40,
           "step": 1
+        }
+      },
+      "forward_max_single_image_mb": {
+        "type": "int",
+        "description": "合并转发单张原图大小上限 (MB)",
+        "hint": "单张原图流式落盘并在合并转发中发送的最大体积限制。",
+        "default": 10,
+        "slider": {
+          "min": 1,
+          "max": 30,
+          "step": 1
+        }
+      },
+      "forward_max_total_images_mb": {
+        "type": "int",
+        "description": "合并转发原图总大小上限 (MB)",
+        "hint": "单次合并转发中全部附带原图的累计落盘体积上限。",
+        "default": 50,
+        "slider": {
+          "min": 5,
+          "max": 200,
+          "step": 5
         }
       }
     }

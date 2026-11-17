@@ -2,6 +2,20 @@
 
 All notable changes to `astrbot_plugin_forum_parser` will be documented in this file.
 
+## [v0.4.1] - 2026-11-18
+
+### Fixed
+- **Stage1st 附件图片 403 与自动重登认证修复**：
+  - 修复 Discuz 响应头中固定的 `B7Y9_2f85_invite_auth=deleted` 被误判为网页登录成功导致长期使用未登录空 Cookie 缓存的致命缺陷；改为严格校验真实 `*_auth` 凭据并自动清理历史脏 Cookie 缓存。
+  - 按照 Discuz Mobile v4 登录流程完善网页会话登录：先 `GET` 预取 `saltkey` 与 `formhash` 再提交登录，并通过显式 `Cookie:` 请求头精确下发认证 Cookie（规避 `aiohttp` 对特殊字符 Cookie 的引号转义差异），支持 `attach_nopermission` 及图片 `403` 自动刷新登录重试。
+- **Bangumi 全系表情（经典/TV/娘化动态大表情/Bmoji/贴贴）修复**：
+  - 修复 `bgm01~23` 经典表情后缀映射错误（除 `11`/`23` 为 `.gif` 外其余为 `.png`）及 TV 表情编号扩展至 `125`；支持 `(musume_XX)` / `(blake_XX)` 动图以 `72px` 清晰展示并放宽表情大小上限至 `2MB`，像素表情启用 `image-rendering: pixelated`。
+  - 修复 Bangumi 贴贴 `data_likes_list` 在 `"value": "0"` 时返回 JSON 数组被丢弃、个位表情编号未零填充导致的贴贴缺失/裂图问题。
+  - 新增 Bangumi **Bmoji 组合表情（`<span class="bmo" data-code="...">`）** 离线渲染支持：按需提取帖子内引用的 PNG 图层并内联 Data URI 与清单注入模板，在无外部请求条件下完整绘制 `<canvas>` 表情。
+- **Bangumi 超长日志/长评（如 `blog/337198`）QQ 发送失败与 T2I 413 修复**：
+  - 为 `render_options`、`onebot_options` 与 `telegram_options` 全面开放可调图片体积设置（`max_inline_single_mb`、`max_inline_total_mb`、`max_rendered_card_mb`、`forward_max_single_image_mb`、`forward_max_total_images_mb`、`upload_max_single_image_mb`、`upload_max_total_images_mb`）。
+  - 将 `s2.loli.net`、`lain.bgm.tv` 等公共无防盗链图床纳入免重传列表并自动转换 `.svg` 徽章为内联文字标签，大幅提速多图长评解析；针对超长内容新增智能多卡自动分页渲染与 T2I `413` / 超体积自动降级重绘兜底，避免单图突破 20MB 触发 QQ Highway 上传错误（`error_code=921`）。
+
 ## [v0.4.0] - 2026-11-18
 
 ### Added

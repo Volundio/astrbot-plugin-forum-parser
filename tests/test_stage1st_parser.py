@@ -647,3 +647,131 @@ async def test_s1_specific_floor_findpost_parse_and_invisible_floor_unblock() ->
     assert res_b.is_unblocked_invisible is True
     assert "第 88 楼被禁言回复原文" in res_b.content_html
     assert "81楼无关内容" not in res_b.content_html
+
+
+@pytest.mark.asyncio
+async def test_s1_invite_auth_deleted_rejected_and_two_step_login_heals_403() -> None:
+    """回归测试：
+    1. 历史缓存中误存的 `B7Y9_2f85_invite_auth=deleted` 会被识别为无效态并清除；
+    2. 登录流程先 GET 预取 saltkey 与 formhash，再 POST 提交；仅带 `invite_auth=deleted` 的失败响应不会被误判登录成功；
+    3. 页面出现 `attach_nopermission` 或站内附件图首次返回 403 时，自动刷新登录并用新 Cookie 成功拉取附件图。
+    """
+    kv_store: dict[str, object] = {
+        "s1_web_cookies": {"B7Y9_2f85_invite_auth": "deleted", "B7Y9_2f85_saltkey": "stale"},
+        "s1_web_username": "s1user",
+    }
+
+    async def kv_get(k: str, default: object = None) -> object:
+        return kv_store.get(k, default)
+
+    async def kv_set(k: str, val: object) -> None:
+        kv_store[k] = val
+
+    mocked = MockHttpRouter()
+    # 第一轮校验：验证登录失败仅返回 invite_auth=deleted 时绝不误判为登录成功
+    mocked.get(
+        "https://stage1st.com/2b/api/mobile/index.php?version=4&module=login",
+        status=200,
+        payload={"Variables": {"formhash": "fh_bad"}},
+        headers={"Set-Cookie": "B7Y9_2f85_saltkey=s0"},
+    )
+    mocked.post(
+        "https://stage1st.com/2b/api/mobile/index.php?version=4&module=login&loginsubmit=yes&loginfield=auto&cookietime=2592000",
+        status=200,
+        body='{"Message":{"messageval":"login_invalid"}}',
+        headers={"Set-Cookie": "B7Y9_2f85_invite_auth=deleted; Max-Age=0"},
+    )
+    async with aiohttp.ClientSession(middlewares=[mocked.middleware]) as sess:
+        p_bad = Stage1stParser(
+            sess,
+            config={"enabled": True, "username": "s1user", "password": "wrong"},
+            kv_getter=kv_get,
+            kv_setter=kv_set,
+        )
+        # _get_web_cookies 应主动作废历史只有 invite_auth=deleted 的假阳性缓存
+        assert await p_bad._get_web_cookies() == {}
+        assert kv_store["s1_web_cookies"] == {}
+        assert await p_bad._login_web_session() == {}
+
+    # 第二轮校验：真实两步登录成功 -> attach_nopermission 页面重取 + img.stage1st.com 携带 Cookie 200 内联成功
+    link = ForumLink(
+        forum=ForumType.STAGE1ST,
+        tid="2294225",
+        original_url="https://stage1st.com/2b/thread-2294225-1-1.html",
+        canonical_url="https://stage1st.com/2b/thread-2294225-1-1.html",
+    )
+    kv_good: dict[str, object] = {
+        "s1_web_cookies": {"B7Y9_2f85_auth": "expired_token", "B7Y9_2f85_saltkey": "old_salt"},
+        "s1_web_username": "s1user",
+    }
+
+    async def kv_get_g(k: str, default: object = None) -> object:
+        return kv_good.get(k, default)
+
+    async def kv_set_g(k: str, val: object) -> None:
+        kv_good[k] = val
+
+    mocked2 = MockHttpRouter()
+    guest_html = """
+    <html><body>
+      <div id="postlist">
+        <h1 class="ts"><span id="thread_subject">盒马帖子</span></h1>
+        <div id="post_70521258">
+          <div class="pi"><strong><a id="postnum70521258">楼主</a></strong>
+            <div class="authi"><a href="space-uid-1.html" class="xw1">lymm2003</a></div>
+          </div>
+          <td id="postmessage_70521258">正文文本</td>
+          <div class="attach_nopermission">需要登录</div>
+        </div>
+      </div>
+    </body></html>
+    """
+    authed_html = """
+    <html><body>
+      <div id="postlist">
+        <h1 class="ts"><span id="thread_subject">盒马帖子</span></h1>
+        <div id="post_70521258">
+          <div class="pi"><strong><a id="postnum70521258">楼主</a></strong>
+            <div class="authi"><a href="space-uid-1.html" class="xw1">lymm2003</a></div>
+          </div>
+          <td id="postmessage_70521258">正文文本 <img id="aimg_1" file="https://img.stage1st.com/forum/202611/17/att1.png" /></td>
+        </div>
+      </div>
+    </body></html>
+    """
+    mocked2.get("https://stage1st.com/2b/thread-2294225-1-1.html", status=200, body=guest_html)
+    mocked2.get(
+        "https://stage1st.com/2b/api/mobile/index.php?version=4&module=login",
+        status=200,
+        payload={"Variables": {"formhash": "fh_9988"}},
+        headers={"Set-Cookie": "B7Y9_2f85_saltkey=fresh_salt"},
+    )
+    mocked2.post(
+        "https://stage1st.com/2b/api/mobile/index.php?version=4&module=login&loginsubmit=yes&loginfield=auto&cookietime=2592000",
+        status=200,
+        body='{"Message":{"messageval":"login_succeed"}}',
+        headers={"Set-Cookie": "B7Y9_2f85_auth=fresh%2Bauth%2Fval%3D%3D; Path=/"},
+    )
+    mocked2.get("https://stage1st.com/2b/thread-2294225-1-1.html", status=200, body=authed_html)
+    mocked2.get(
+        "https://img.stage1st.com/forum/202611/17/att1.png",
+        status=200,
+        body=PNG_1X1,
+        headers={"Content-Type": "image/png"},
+    )
+
+    async with aiohttp.ClientSession(middlewares=[mocked2.middleware]) as sess2:
+        p_good = Stage1stParser(
+            sess2,
+            config={"enabled": True, "username": "s1user", "password": "secret"},
+            kv_getter=kv_get_g,
+            kv_setter=kv_set_g,
+        )
+        res = await p_good.parse_thread(link)
+
+    assert "data:image/png;base64," in res.content_html
+    assert not res.has_uninlined_images
+    # 验证图片请求显式携带未被 SimpleCookie 加引号的新 auth Cookie
+    img_reqs = [r for r in mocked2.requests if "img.stage1st.com" in r[1]]
+    assert len(img_reqs) == 1
+    assert "B7Y9_2f85_auth=fresh%2Bauth%2Fval%3D%3D" in img_reqs[0][2].get("Cookie", "")

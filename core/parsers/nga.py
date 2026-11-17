@@ -1013,6 +1013,10 @@ class NgaParser(BaseForumParser):
         max_content_chars: int = 15000,
         temp_scope: TempScope | None = None,
         rehost_oversize_fn: Callable[[Path, str], Awaitable[str | None]] | None = None,
+        max_inline_single_bytes: int | None = None,
+        max_inline_total_bytes: int | None = None,
+        max_download_single_bytes: int | None = None,
+        max_download_total_bytes: int | None = None,
     ) -> ParsedThread:
         tid = link.tid
         target_pid = link.pid
@@ -1114,6 +1118,16 @@ class NgaParser(BaseForumParser):
         post_image_urls: list[str] = []
         pre_downloaded_files: dict[int, str] = {}
         uninlined_flags: list[bool] = []
+        size_kwargs: dict[str, int] = {}
+        if max_inline_single_bytes is not None:
+            size_kwargs["max_inline_single_bytes"] = max_inline_single_bytes
+        if max_inline_total_bytes is not None:
+            size_kwargs["max_inline_total_bytes"] = max_inline_total_bytes
+        if max_download_single_bytes is not None:
+            size_kwargs["max_download_single_bytes"] = max_download_single_bytes
+        if max_download_total_bytes is not None:
+            size_kwargs["max_download_total_bytes"] = max_download_total_bytes
+
         clean_html, is_truncated, char_count, omitted_imgs = await process_post_html(
             bb_html,
             base_url=NGA_WEB_BASE,
@@ -1131,6 +1145,7 @@ class NgaParser(BaseForumParser):
             rehost_oversize_fn=rehost_oversize_fn,
             out_downloaded_files=pre_downloaded_files,
             out_has_uninlined_images=uninlined_flags,
+            **size_kwargs,
         )
 
         author_avatar = rewrite_legacy_media_url(extracted["author_avatar"])

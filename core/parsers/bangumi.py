@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import copy
 import html
 import json
 import re
+from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -52,6 +55,20 @@ DATA_LIKES_RE = re.compile(r"var\s+data_likes_list\s*=\s*(\{.*?\});", re.DOTALL)
 SUBJECT_ID_RE = re.compile(r"/subject/(\d+)")
 USER_ID_RE = re.compile(r"/user/([^/?#]+)")
 BGM_SMILE_RE = re.compile(r"\(bgm(\d+)\)", re.IGNORECASE)
+BGM_MUSUME_RE = re.compile(r"\(musume_(\d+)\)", re.IGNORECASE)
+BGM_BLAKE_RE = re.compile(r"\(blake_(\d+)\)", re.IGNORECASE)
+BGM_BMO_TEXT_RE = re.compile(r"\(bmo[A-Za-z0-9_:|=-]{1,200}\)")
+BMO_SPAN_RE = re.compile(
+    r'<span\b[^>]*\bclass="[^"]*\bbmo\b[^"]*"[^>]*\bdata-code="([^"]+)"[^>]*>(?:</span>)?',
+    re.IGNORECASE,
+)
+BMO_SPAN_FALLBACK_RE = re.compile(
+    r'<span\b[^>]*\bclass="[^"]*\bbmo\b[^"]*"[^>]*>.*?</span>',
+    re.IGNORECASE | re.DOTALL,
+)
+BGM_CLASSIC_GIF_CODES = frozenset({11, 23})
+BGM_BMO_JS_URL = f"{BGM_WEB_BASE}/js/lib/bmo/bmo.js"
+BGM_BMO_MANIFEST_URL = f"{BGM_WEB_BASE}/js/lib/bmo/assets/manifest.local.json"
 
 BGM_KNOWN_BBCODE_TAGS = frozenset(
     {
@@ -132,8 +149,24 @@ def _extract_leading_category(title: str) -> tuple[str, str]:
     return "", (title or "").strip()
 
 
+def _bgm_reaction_emoji_url(emoji_val: str) -> str:
+    """根据 Bangumi data_likes_list 的 emoji 编号构造正确的贴贴表情地址（兼容零填充与分段目录）。"""
+    e = (emoji_val or "").strip()
+    if not e:
+        return ""
+    if e.isdigit():
+        num = int(e)
+        if 1 <= num <= 105:
+            return f"{BGM_WEB_BASE}/img/smiles/tv/{num:02d}.gif"
+        if 200 <= num <= 299:
+            return f"{BGM_WEB_BASE}/img/smiles/tv_vs/bgm_{num}.png"
+        if 500 <= num <= 599:
+            return f"{BGM_WEB_BASE}/img/smiles/tv_500/bgm_{num}.gif"
+    return f"{BGM_WEB_BASE}/img/smiles/tv/{e}.gif"
+
+
 def _parse_likes_reactions(raw_html: str, post_id: str) -> tuple[int | None, list[ReactionItem]]:
-    """从页面内联脚本 `var data_likes_list = ...` 提取指定楼层/日志的贴贴表态分布。"""
+    """从页面内联脚本 `var data_likes_list = ...` 提取指定楼层/日志的贴贴表态分布（兼容 dict 与 list）。"""
     if not raw_html or not post_id:
         return None, []
     m = DATA_LIKES_RE.search(raw_html)
@@ -146,13 +179,19 @@ def _parse_likes_reactions(raw_html: str, post_id: str) -> tuple[int | None, lis
     if not isinstance(data, dict):
         return None, []
 
-    target_dict = data.get(str(post_id))
-    if not isinstance(target_dict, dict) or not target_dict:
+    raw_target = data.get(str(post_id))
+    if isinstance(raw_target, dict):
+        raw_entries = list(raw_target.values())
+    elif isinstance(raw_target, list):
+        raw_entries = raw_target
+    else:
+        return None, []
+    if not raw_entries:
         return None, []
 
     items: list[ReactionItem] = []
     total_cnt = 0
-    for val in target_dict.values():
+    for val in raw_entries:
         if not isinstance(val, dict):
             continue
         emoji = str(val.get("emoji") or "").strip()
@@ -163,7 +202,7 @@ def _parse_likes_reactions(raw_html: str, post_id: str) -> tuple[int | None, lis
         if cnt <= 0:
             continue
         total_cnt += cnt
-        emoji_url = f"{BGM_WEB_BASE}/img/smiles/tv/{emoji}.gif" if emoji else ""
+        emoji_url = _bgm_reaction_emoji_url(emoji)
         items.append(
             ReactionItem(
                 emoji_url=emoji_url,
@@ -177,9 +216,11 @@ def _parse_likes_reactions(raw_html: str, post_id: str) -> tuple[int | None, lis
 
 
 def _bgm_smile_url(code_num: int) -> str:
+    """按 Bangumi 官方表情编号规则返回对应图标 URL（注意 bgm01~23 仅 11/23 为 .gif，其余为 .png）。"""
     if 1 <= code_num <= 23:
-        return f"{BGM_WEB_BASE}/img/smiles/bgm/{code_num:02d}.gif"
-    if 24 <= code_num <= 123:
+        ext = "gif" if code_num in BGM_CLASSIC_GIF_CODES else "png"
+        return f"{BGM_WEB_BASE}/img/smiles/bgm/{code_num:02d}.{ext}"
+    if 24 <= code_num <= 125:
         return f"{BGM_WEB_BASE}/img/smiles/tv/{code_num - 23:02d}.gif"
     if 200 <= code_num <= 299:
         return f"{BGM_WEB_BASE}/img/smiles/tv_vs/bgm_{code_num}.png"
@@ -221,18 +262,38 @@ def convert_bgm_bbcode_to_html(bbcode: str) -> str:
     # 先进行 HTML 转义，防止 XSS 注入
     escaped = html.escape(text, quote=False)
 
-    # 还原 `(bgmXXX)` 小表情为标准 <img> 节点，交由 html_sanitizer 内嵌
+    # 还原 `(bgmXXX)`、`(musume_XX)`、`(blake_XX)` 与 `(bmo...)` 表情为标准 HTML 节点
     def _smile_sub(m: re.Match[str]) -> str:
         num = int(m.group(1))
         su = _bgm_smile_url(num)
         if not su:
             return m.group(0)
-        return (
+        return _stash(
             f'<img src="{html.escape(su, quote=True)}" class="smile" '
             f'smileid="{num}" alt="(bgm{num})" />'
         )
 
     escaped = BGM_SMILE_RE.sub(_smile_sub, escaped)
+    escaped = BGM_MUSUME_RE.sub(
+        lambda m: _stash(
+            f'<img src="https://lain.bgm.tv/img/smiles/musume/musume_{m.group(1)}.gif" '
+            f'class="smile smile-dynamic" smileid="musume_{m.group(1)}" alt="(musume_{m.group(1)})" />'
+        ),
+        escaped,
+    )
+    escaped = BGM_BLAKE_RE.sub(
+        lambda m: _stash(
+            f'<img src="https://lain.bgm.tv/img/smiles/blake/blake_{m.group(1)}.gif" '
+            f'class="smile smile-dynamic" smileid="blake_{m.group(1)}" alt="(blake_{m.group(1)})" />'
+        ),
+        escaped,
+    )
+    escaped = BGM_BMO_TEXT_RE.sub(
+        lambda m: _stash(
+            f'<span class="bmo" data-code="{html.escape(m.group(0), quote=True)}"></span>'
+        ),
+        escaped,
+    )
 
     # 处理 [url=...]text[/url] 与 [url]link[/url]
     def _url_sub(m: re.Match[str]) -> str:
@@ -312,6 +373,9 @@ class BangumiParser(BaseForumParser):
     ) -> None:
         super().__init__(session, **kwargs)
         self.cfg: dict[str, Any] = config or {}
+        self._cached_bmo_js: str | None = None
+        self._cached_bmo_manifest: dict[str, Any] | None = None
+        self._bmo_png_cache: OrderedDict[str, str] = OrderedDict()
 
     def update_config(self, config: dict[str, Any] | None) -> None:
         self.cfg = config or {}
@@ -945,7 +1009,7 @@ class BangumiParser(BaseForumParser):
 
         _schedule(author_avatar)
         _schedule(group_icon)
-        for rx in reactions[:6]:
+        for rx in reactions[:10]:
             _schedule(rx.emoji_url, max_bytes=128 * 1024)
         for rs in related_subjects[:6]:
             _schedule(rs.cover)
@@ -971,6 +1035,203 @@ class BangumiParser(BaseForumParser):
             resolved_map.get(group_icon, ""),
         )
 
+    @staticmethod
+    def _decode_bmo_needed_srcs(manifest: dict[str, Any], codes: list[str]) -> set[str]:
+        """根据 bmo.js 的 versionOrder + compactReverse 规则，按需解析出 Bmoji 所需 PNG 路径。"""
+        version_buckets: dict[int, list[tuple[str, str]]] = {}
+        item_index: dict[str, str] = {}
+        for cat_key, cat in manifest.items():
+            if not isinstance(cat, dict) or not isinstance(cat.get("items"), list):
+                continue
+            cat_code = str(cat.get("id") or cat_key)
+            for item in cat["items"]:
+                if not isinstance(item, dict) or not item.get("id") or not item.get("src"):
+                    continue
+                item_id = str(item["id"])
+                code_id = (
+                    f"{cat_code}{item_id}"
+                    if (cat_code and item_id.isdigit() and not item.get("custom"))
+                    else item_id
+                )
+                src = str(item["src"])
+                alias = str(item["alias"]) if item.get("alias") else ""
+                item_index.setdefault(item_id, src)
+                if code_id:
+                    item_index.setdefault(code_id, src)
+                if alias:
+                    item_index.setdefault(alias, src)
+                try:
+                    ver = max(1, int(item.get("version") or 1))
+                except (TypeError, ValueError):
+                    ver = 1
+                version_buckets.setdefault(ver, []).append((code_id, src))
+
+        compact_reverse: list[str] = []
+        seen_primary: set[str] = set()
+        for ver in sorted(version_buckets):
+            for primary_key, src in version_buckets[ver]:
+                if primary_key and primary_key not in seen_primary:
+                    seen_primary.add(primary_key)
+                    compact_reverse.append(src)
+
+        needed: set[str] = set()
+        for raw_code in codes:
+            trimmed = raw_code.strip()
+            if trimmed.startswith("(") and trimmed.endswith(")"):
+                trimmed = trimmed[1:-1]
+            if not trimmed:
+                continue
+            if trimmed.startswith("bmoC"):
+                payload = trimmed[4:].lstrip("_:-")
+                if not payload:
+                    continue
+                pad = "=" * ((4 - len(payload) % 4) % 4)
+                try:
+                    raw_bytes = base64.urlsafe_b64decode(payload + pad)
+                except Exception:
+                    continue
+                pos = 0
+
+                def _read_varuint() -> int | None:
+                    nonlocal pos
+                    val = 0
+                    shift = 0
+                    while pos < len(raw_bytes):
+                        b = raw_bytes[pos]
+                        pos += 1
+                        val |= (b & 0x7F) << shift
+                        if (b & 0x80) == 0:
+                            return val
+                        shift += 7
+                        if shift > 35:
+                            return None
+                    return None
+
+                while pos < len(raw_bytes):
+                    combined = _read_varuint()
+                    if combined is None:
+                        break
+                    cid = combined >> 7
+                    flags = combined & 127
+                    if 0 <= cid < len(compact_reverse):
+                        needed.add(compact_reverse[cid])
+                    for bit in (1, 2, 4, 8, 16, 32):
+                        if flags & bit and _read_varuint() is None:
+                            pos = len(raw_bytes)
+                            break
+                    if flags & 64:
+                        elen = _read_varuint()
+                        if elen is None:
+                            break
+                        pos += elen
+            elif trimmed.lower().startswith("bmo"):
+                payload = trimmed[3:].lstrip("_:-")
+                parts = [p for p in payload.split("_") if p]
+                idx = 0
+                while idx < len(parts):
+                    matched = False
+                    for seg_len in range(min(3, len(parts) - idx), 0, -1):
+                        cand = "_".join(parts[idx : idx + seg_len]).split(":", 1)[0]
+                        if cand in item_index:
+                            needed.add(item_index[cand])
+                            idx += seg_len
+                            matched = True
+                            break
+                    if not matched:
+                        idx += 1
+        return needed
+
+    async def _ensure_bmo_base_assets(self) -> tuple[str | None, dict[str, Any] | None]:
+        if self._cached_bmo_js is None:
+            try:
+                async with self.session.get(
+                    BGM_BMO_JS_URL,
+                    headers={"User-Agent": DEFAULT_BROWSER_UA, "Referer": BGM_WEB_BASE + "/"},
+                    timeout=BGM_REQUEST_TIMEOUT,
+                ) as resp:
+                    if resp.status == 200:
+                        raw = await read_response_bounded(resp)
+                        self._cached_bmo_js = raw.decode("utf-8", errors="replace")
+            except Exception as e:
+                logger.debug(f"拉取 Bangumi Bmoji 运行时脚本失败: {e}")
+
+        if self._cached_bmo_manifest is None:
+            try:
+                async with self.session.get(
+                    BGM_BMO_MANIFEST_URL,
+                    headers={"User-Agent": DEFAULT_BROWSER_UA, "Referer": BGM_WEB_BASE + "/"},
+                    timeout=BGM_REQUEST_TIMEOUT,
+                ) as resp:
+                    if resp.status == 200:
+                        raw = await read_response_bounded(resp)
+                        obj = json.loads(raw.decode("utf-8", errors="replace"))
+                        if isinstance(obj, dict):
+                            self._cached_bmo_manifest = obj
+            except Exception as e:
+                logger.debug(f"拉取 Bangumi Bmoji 资源清单失败: {e}")
+
+        return self._cached_bmo_js, self._cached_bmo_manifest
+
+    async def _build_bmo_script_html(self, clean_html: str, *, referer: str) -> tuple[str, str]:
+        """当正文含 Bangumi `<span class="bmo" data-code="...">` 时按需打包离线 Bmoji 脚本。"""
+        bmo_codes = BMO_SPAN_RE.findall(clean_html or "")
+        if not bmo_codes:
+            return clean_html, ""
+
+        bmo_js, manifest = await self._ensure_bmo_base_assets()
+        if not bmo_js or not manifest:
+            fallback_html = BMO_SPAN_FALLBACK_RE.sub(
+                '<span class="forum-emote">[bmo表情]</span>', clean_html
+            )
+            return fallback_html, ""
+
+        needed_srcs = self._decode_bmo_needed_srcs(manifest, bmo_codes)
+        missing_srcs = [s for s in sorted(needed_srcs) if s not in self._bmo_png_cache]
+        if missing_srcs:
+            sem = asyncio.Semaphore(4)
+
+            async def _fetch_part(rel_src: str) -> tuple[str, str | None]:
+                full_u = f"{BGM_WEB_BASE}/js/lib/bmo/{rel_src.lstrip('./')}"
+                async with sem:
+                    uri = await _fetch_image_as_data_uri(
+                        self.session,
+                        full_u,
+                        referer=referer,
+                        max_bytes=512 * 1024,
+                    )
+                    return rel_src, uri
+
+            fetched = await asyncio.gather(*(_fetch_part(s) for s in missing_srcs))
+            for rel_src, uri in fetched:
+                if uri:
+                    self._bmo_png_cache[rel_src] = uri
+                    while len(self._bmo_png_cache) > 160:
+                        self._bmo_png_cache.popitem(last=False)
+
+        inlined_manifest = copy.deepcopy(manifest)
+        for cat in inlined_manifest.values():
+            if not isinstance(cat, dict) or not isinstance(cat.get("items"), list):
+                continue
+            for item in cat["items"]:
+                if not isinstance(item, dict):
+                    continue
+                src = str(item.get("src") or "")
+                if src in self._bmo_png_cache:
+                    item["src"] = self._bmo_png_cache[src]
+
+        patched_js = bmo_js.replace(
+            "DEFAULT_ASSTET_PATH + item.src",
+            "(String(item.src).indexOf('data:') === 0 ? item.src : DEFAULT_ASSTET_PATH + item.src)",
+        )
+        manifest_json = json.dumps(inlined_manifest, ensure_ascii=False).replace("</", "<\\/")
+        script_html = (
+            f"<script>\nwindow.__BMOJI_ASSETS__ = {manifest_json};\n"
+            f"{patched_js}\n"
+            "if (window.Bmoji) { window.Bmoji.configure({ width: 42, height: 42 }); "
+            "window.Bmoji.renderAll(); }\n</script>"
+        )
+        return clean_html, script_html
+
     async def parse_thread(
         self,
         link: ForumLink,
@@ -982,6 +1243,10 @@ class BangumiParser(BaseForumParser):
         max_content_chars: int = 15000,
         temp_scope: TempScope | None = None,
         rehost_oversize_fn: Callable[[Path, str], Awaitable[str | None]] | None = None,
+        max_inline_single_bytes: int | None = None,
+        max_inline_total_bytes: int | None = None,
+        max_download_single_bytes: int | None = None,
+        max_download_total_bytes: int | None = None,
     ) -> ParsedThread:
         sub_type = link.sub_type or "group_topic"
         tid = link.tid
@@ -1032,6 +1297,16 @@ class BangumiParser(BaseForumParser):
         post_image_urls: list[str] = []
         pre_downloaded_files: dict[int, str] = {}
         uninlined_flags: list[bool] = []
+        size_kwargs: dict[str, int] = {}
+        if max_inline_single_bytes is not None:
+            size_kwargs["max_inline_single_bytes"] = max_inline_single_bytes
+        if max_inline_total_bytes is not None:
+            size_kwargs["max_inline_total_bytes"] = max_inline_total_bytes
+        if max_download_single_bytes is not None:
+            size_kwargs["max_download_single_bytes"] = max_download_single_bytes
+        if max_download_total_bytes is not None:
+            size_kwargs["max_download_total_bytes"] = max_download_total_bytes
+
         clean_html, is_truncated, char_count, omitted_imgs = await process_post_html(
             extracted["raw_html"],
             base_url=BGM_WEB_BASE + "/",
@@ -1049,7 +1324,19 @@ class BangumiParser(BaseForumParser):
             rehost_oversize_fn=rehost_oversize_fn,
             out_downloaded_files=pre_downloaded_files,
             out_has_uninlined_images=uninlined_flags,
+            **size_kwargs,
         )
+
+        bmo_script_html = ""
+        if BMO_SPAN_RE.search(clean_html):
+            if embed_images and prefetch_data_uri:
+                clean_html, bmo_script_html = await self._build_bmo_script_html(
+                    clean_html, referer=canonical_url
+                )
+            else:
+                clean_html = BMO_SPAN_FALLBACK_RE.sub(
+                    '<span class="forum-emote">[bmo表情]</span>', clean_html
+                )
 
         author_avatar = extracted["author_avatar"]
         group_icon = extracted["group_icon"]
@@ -1099,4 +1386,5 @@ class BangumiParser(BaseForumParser):
             related_subjects=related_subjects,
             pre_downloaded_files=pre_downloaded_files,
             has_uninlined_images=bool(uninlined_flags),
+            bmo_script_html=bmo_script_html,
         )

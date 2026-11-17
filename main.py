@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import os
 from pathlib import Path
@@ -14,7 +15,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
 
 if __package__:
-    from .core.html_sanitizer import prepare_post_images_for_forward
+    from .core.html_sanitizer import prepare_post_images_for_forward, split_html_into_card_pages
     from .core.io_guard import BoundedTaskLimiter
     from .core.models import (
         ForumLink,
@@ -34,7 +35,7 @@ if __package__:
         parse_forum_url,
     )
 else:
-    from core.html_sanitizer import prepare_post_images_for_forward
+    from core.html_sanitizer import prepare_post_images_for_forward, split_html_into_card_pages
     from core.io_guard import BoundedTaskLimiter
     from core.models import (
         ForumLink,
@@ -69,7 +70,14 @@ def _is_manual_cmd_text(message_str: str) -> bool:
 
 
 def _estimate_parsed_thread_bytes(t: ParsedThread) -> int:
-    return len(t.content_html) + len(t.author_avatar) + len(t.group_icon) + len(t.title) + 512
+    return (
+        len(t.content_html)
+        + len(t.bmo_script_html)
+        + len(t.author_avatar)
+        + len(t.group_icon)
+        + len(t.title)
+        + 512
+    )
 
 
 def _get_event_platform(event: Any) -> str:
@@ -232,9 +240,17 @@ class ForumParserPlugin(Star):
 
     def _ensure_services(self) -> None:
         parse_opts = self._get_sub_cfg("parse_options")
+        onebot_opts = self._get_sub_cfg("onebot_options")
+        tg_opts = self._get_sub_cfg("telegram_options")
         self._task_limiter.update_limits(
             max_concurrent=int(parse_opts.get("max_concurrent_tasks", 2)),
             max_waiting=6,
+        )
+        fwd_total_mb = max(5, int(onebot_opts.get("forward_max_total_images_mb", 50)))
+        tg_total_mb = max(5, int(tg_opts.get("upload_max_total_images_mb", 50)))
+        self._temp_mgr.max_dir_bytes = max(
+            160 * 1024 * 1024,
+            (2 * max(fwd_total_mb, tg_total_mb) + 64) * 1024 * 1024,
         )
 
         if self._http_session is None or self._http_session.closed:
@@ -372,7 +388,7 @@ class ForumParserPlugin(Star):
         self,
         event: AstrMessageEvent,
         parsed_thread: ParsedThread,
-        render_res: RenderResult,
+        render_res: RenderResult | list[RenderResult],
         onebot_opts: dict[str, Any],
         temp_scope: TempScope,
     ) -> Any:
@@ -406,27 +422,41 @@ class ForumParserPlugin(Star):
             meta_parts.append(parsed_thread.created_at)
         summary_text = f"📌 {title_line}\n{'  |  '.join(meta_parts)}\n🔗 {parsed_thread.url}"
 
-        card_img_comp = (
-            Comp.Image.fromFileSystem(render_res.image_path)
-            if hasattr(Comp.Image, "fromFileSystem")
-            else Comp.Image(file=render_res.image_path)
-        )
-
         nodes: list[Any] = [
             Comp.Node(
                 uin=bot_uin,
                 name=parsed_thread.forum.display_name,
                 content=[Comp.Plain(summary_text)],
-            ),
-            Comp.Node(
-                uin=bot_uin,
-                name=card_node_name,
-                content=[card_img_comp],
-            ),
+            )
         ]
+
+        card_results = render_res if isinstance(render_res, list) else [render_res]
+        total_cards = len(card_results)
+        for c_idx, rr in enumerate(card_results, start=1):
+            card_img_comp = (
+                Comp.Image.fromFileSystem(rr.image_path)
+                if hasattr(Comp.Image, "fromFileSystem")
+                else Comp.Image(file=rr.image_path)
+            )
+            node_name = (
+                card_node_name if total_cards == 1 else f"{card_node_name} ({c_idx}/{total_cards})"
+            )
+            nodes.append(
+                Comp.Node(
+                    uin=bot_uin,
+                    name=node_name,
+                    content=[card_img_comp],
+                )
+            )
 
         include_post_imgs = bool(onebot_opts.get("forward_include_images", True))
         max_forward_imgs = int(onebot_opts.get("forward_max_images", 20))
+        forward_single_bytes = (
+            max(1, int(onebot_opts.get("forward_max_single_image_mb", 10))) * 1024 * 1024
+        )
+        forward_total_bytes = (
+            max(1, int(onebot_opts.get("forward_max_total_images_mb", 50))) * 1024 * 1024
+        )
         if include_post_imgs and parsed_thread.post_image_urls and max_forward_imgs > 0:
             if parsed_thread.forum == ForumType.STAGE1ST and self._s1_parser is not None:
                 cookies, same_hosts = await self._s1_parser.get_media_auth_context()
@@ -446,6 +476,8 @@ class ForumParserPlugin(Star):
                 referer=parsed_thread.url,
                 cookies=cookies,
                 same_site_hosts=same_hosts,
+                max_single_bytes=forward_single_bytes,
+                max_total_bytes=forward_total_bytes,
                 pre_downloaded_files=parsed_thread.pre_downloaded_files,
             )
             total_imgs = len(local_img_files)
@@ -503,6 +535,21 @@ class ForumParserPlugin(Star):
             max_inline_images = int(render_opts.get("max_inline_images", 15))
             enable_length_limit = bool(render_opts.get("enable_length_limit", False))
             max_content_chars = int(render_opts.get("max_content_chars", 15000))
+            inline_single_bytes = (
+                max(1, int(render_opts.get("max_inline_single_mb", 6))) * 1024 * 1024
+            )
+            inline_total_bytes = (
+                max(1, int(render_opts.get("max_inline_total_mb", 12))) * 1024 * 1024
+            )
+
+            onebot_opts = self._get_sub_cfg("onebot_options")
+            use_onebot_forward = bool(onebot_opts.get("use_forward", True))
+            forward_single_bytes = (
+                max(1, int(onebot_opts.get("forward_max_single_image_mb", 10))) * 1024 * 1024
+            )
+            forward_total_bytes = (
+                max(1, int(onebot_opts.get("forward_max_total_images_mb", 50))) * 1024 * 1024
+            )
 
             tg_opts = self._get_sub_cfg("telegram_options")
             tg_mode = str(tg_opts.get("delivery_mode") or "telegraph").strip().lower()
@@ -510,6 +557,12 @@ class ForumParserPlugin(Star):
             tg_max_images = int(tg_opts.get("max_upload_images", 25))
             tg_upload_url = str(tg_opts.get("image_upload_url") or DEFAULT_SDA1_UPLOAD_URL).strip()
             tg_fallback_to_image = bool(tg_opts.get("fallback_to_image", True))
+            tg_single_bytes = (
+                max(1, int(tg_opts.get("upload_max_single_image_mb", 10))) * 1024 * 1024
+            )
+            tg_total_bytes = (
+                max(1, int(tg_opts.get("upload_max_total_images_mb", 50))) * 1024 * 1024
+            )
 
             if link.forum == ForumType.STAGE1ST:
                 parser = self._s1_parser
@@ -561,9 +614,12 @@ class ForumParserPlugin(Star):
                         upload_images=embed_images,
                         upload_url=tg_upload_url,
                         max_upload_images=tg_max_images,
+                        max_single_image_bytes=tg_single_bytes,
+                        max_total_images_bytes=tg_total_bytes,
                     )
                     if not tg_from_cache:
                         tg_thread.content_html = ""
+                        tg_thread.bmo_script_html = ""
                         tg_thread.author_avatar = ""
                         tg_thread.group_icon = ""
                     await temp_scope.cleanup()
@@ -584,6 +640,8 @@ class ForumParserPlugin(Star):
                 embed_images,
                 True,
                 max_inline_images,
+                inline_single_bytes,
+                inline_total_bytes,
                 enable_length_limit,
                 max_content_chars,
             )
@@ -603,6 +661,12 @@ class ForumParserPlugin(Star):
                         await self._telegraph_publisher._warm_single_image_url(hosted)
                     return hosted
 
+                dl_single_bytes = (
+                    forward_single_bytes if platform_name == "aiocqhttp" else tg_single_bytes
+                )
+                dl_total_bytes = (
+                    forward_total_bytes if platform_name == "aiocqhttp" else tg_total_bytes
+                )
                 parsed_thread = await parser.parse_thread(
                     link,
                     embed_images=embed_images,
@@ -612,6 +676,10 @@ class ForumParserPlugin(Star):
                     max_content_chars=max_content_chars,
                     temp_scope=temp_scope,
                     rehost_oversize_fn=_rehost_oversize,
+                    max_inline_single_bytes=inline_single_bytes,
+                    max_inline_total_bytes=inline_total_bytes,
+                    max_download_single_bytes=dl_single_bytes,
+                    max_download_total_bytes=dl_total_bytes,
                 )
                 # 含内联失败图片或本请求作用域临时文件路径的结果不进入内存缓存，防止坏图缓存污染与跨请求路径失效
                 if (
@@ -624,25 +692,64 @@ class ForumParserPlugin(Star):
             plugin_t2i_ep = str(self.config.get("t2i_endpoint") or "").strip()
             umo = getattr(event, "unified_msg_origin", None)
 
-            render_res = await self._renderer.render_thread_card(
-                parsed_thread,
-                plugin_t2i_endpoint=plugin_t2i_ep,
-                render_options=render_opts,
-                umo=umo,
-                temp_scope=temp_scope,
-            )
-
             try:
                 self._attach_scope_to_event(event, temp_scope)
 
-                onebot_opts = self._get_sub_cfg("onebot_options")
-                use_onebot_forward = bool(onebot_opts.get("use_forward", True))
-
                 if platform_name == "aiocqhttp" and use_onebot_forward:
+                    html_pages = (
+                        [parsed_thread.content_html]
+                        if enable_length_limit
+                        else split_html_into_card_pages(parsed_thread.content_html)
+                    )
+                    if len(html_pages) > 1:
+                        total_pages = len(html_pages)
+                        render_results: list[RenderResult] = []
+                        for p_idx, p_html in enumerate(html_pages, start=1):
+                            is_last_page = p_idx == total_pages
+                            page_thread = dataclasses.replace(
+                                parsed_thread,
+                                content_html=p_html,
+                                floor_label=f"{parsed_thread.display_floor_badge} · {p_idx}/{total_pages}",
+                                rates=parsed_thread.rates if is_last_page else [],
+                                reactions=parsed_thread.reactions if is_last_page else [],
+                                related_subjects=(
+                                    parsed_thread.related_subjects if is_last_page else []
+                                ),
+                                bmo_script_html=(
+                                    parsed_thread.bmo_script_html if 'class="bmo"' in p_html else ""
+                                ),
+                            )
+                            rr = await self._renderer.render_thread_card(
+                                page_thread,
+                                plugin_t2i_endpoint=plugin_t2i_ep,
+                                render_options=render_opts,
+                                umo=umo,
+                                temp_scope=temp_scope,
+                                platform_hint=platform_name,
+                            )
+                            render_results.append(rr)
+                        forward_payload: RenderResult | list[RenderResult] = render_results
+                    else:
+                        forward_payload = await self._renderer.render_thread_card(
+                            parsed_thread,
+                            plugin_t2i_endpoint=plugin_t2i_ep,
+                            render_options=render_opts,
+                            umo=umo,
+                            temp_scope=temp_scope,
+                            platform_hint=platform_name,
+                        )
                     msg_result = await self._build_onebot_forward_result(
-                        event, parsed_thread, render_res, onebot_opts, temp_scope
+                        event, parsed_thread, forward_payload, onebot_opts, temp_scope
                     )
                 elif platform_name == "telegram":
+                    render_res = await self._renderer.render_thread_card(
+                        parsed_thread,
+                        plugin_t2i_endpoint=plugin_t2i_ep,
+                        render_options=render_opts,
+                        umo=umo,
+                        temp_scope=temp_scope,
+                        platform_hint=platform_name,
+                    )
                     # Telegram 长图模式（或 Telegraph 失败兜底）：仅推送单张完整长图，固定走无损文件形式 (Send as File)
                     ext = "png" if render_res.mime_type == "image/png" else "jpg"
                     tid_part = parsed_thread.tid or link.tid
@@ -656,6 +763,14 @@ class ForumParserPlugin(Star):
                         [Comp.File(name=fname, file=render_res.image_path)]
                     )
                 else:
+                    render_res = await self._renderer.render_thread_card(
+                        parsed_thread,
+                        plugin_t2i_endpoint=plugin_t2i_ep,
+                        render_options=render_opts,
+                        umo=umo,
+                        temp_scope=temp_scope,
+                        platform_hint=platform_name,
+                    )
                     msg_result = event.image_result(render_res.image_path)
 
                 parsed_thread.pre_downloaded_files.clear()
@@ -663,6 +778,7 @@ class ForumParserPlugin(Star):
                 # 若该帖子包含内嵌大图而未进入轻量缓存，组装完毕后立即释放大字符串引用以降低发送期内存占用
                 if not from_cache:
                     parsed_thread.content_html = ""
+                    parsed_thread.bmo_script_html = ""
                     parsed_thread.author_avatar = ""
                     parsed_thread.group_icon = ""
 

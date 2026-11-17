@@ -284,12 +284,117 @@ async def test_bangumi_parser_group_topic_subreply_and_blog(tmp_path: Path) -> N
 
 
 def test_bangumi_bbcode_conversion_and_next_api_fallback() -> None:
-    raw = "[b]加粗[/b] [mask]剧透[/mask] (bgm24) (bgm201) [url=https://bgm.tv]BGM[/url]"
+    raw = (
+        "[b]加粗[/b] [mask]剧透[/mask] (bgm01) (bgm11) (bgm24) (bgm124) "
+        "(bgm201) (musume_63) (blake_14) (bmoCAIBzgEqALA) [url=https://bgm.tv]BGM[/url]"
+    )
     out = convert_bgm_bbcode_to_html(raw)
     assert "<strong>加粗</strong>" in out
     assert '<span class="forum-spoiler">剧透</span>' in out
+    assert "https://bangumi.tv/img/smiles/bgm/01.png" in out
+    assert "https://bangumi.tv/img/smiles/bgm/11.gif" in out
     assert "https://bangumi.tv/img/smiles/tv/01.gif" in out
+    assert "https://bangumi.tv/img/smiles/tv/101.gif" in out
     assert "https://bangumi.tv/img/smiles/tv_vs/bgm_201.png" in out
+    assert "https://lain.bgm.tv/img/smiles/musume/musume_63.gif" in out
+    assert "https://lain.bgm.tv/img/smiles/blake/blake_14.gif" in out
+    assert 'class="bmo" data-code="(bmoCAIBzgEqALA)"' in out
+
+
+@pytest.mark.asyncio
+async def test_bangumi_list_reactions_dynamic_smiley_and_bmoji_bundling() -> None:
+    """验证 Bangumi 列表格式贴贴、>256KB 动态大表情、以及 Bmoji (<span class=bmo>) 离线内联脚本打包。"""
+    sample_bmo_html = """
+    <!DOCTYPE html><html><body>
+      <div id="pageHeader"><h1><span><a class="avatar">番组测试组</a></span>[提问] BMO 与贴贴测试</h1></div>
+      <div id="post_4112908" class="postTopic" data-item-user="bgsld">
+        <div class="re_info"><small>#1 - 2026-11-18 01:00</small></div>
+        <div class="inner"><a href="/user/bgsld" class="l">测试作者</a></div>
+        <div class="topic_content">
+          来个组合表情 <span class="bmo" data-code="(bmoCAIBzgEqALA)"></span>
+          再来个大图表情 <img src="//lain.bgm.tv/img/smiles/blake/blake_14.gif" class="smile smile-dynamic" smileid="blake_14" alt="(blake_14)" />
+        </div>
+      </div>
+      <div id="comment_list"></div>
+      <script>
+        var data_likes_list = {"4112908":[{"type":8,"main_id":475911,"value":"0","total":3,"emoji":"44","users":[]}]};
+      </script>
+    </body></html>
+    """
+    fake_gif = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;"
+    # 超过 256KB 但低于 2MB 的动态大表情（如 blake_14.gif 为 347KB）
+    large_dynamic_gif = fake_gif + b"\x00" * (360 * 1024)
+    fake_manifest = {
+        "face": {
+            "id": "f",
+            "layer": 1,
+            "items": [{"id": "1", "src": "./assets/f1.png", "layer": 1}],
+        },
+        "mouth": {
+            "id": "m",
+            "layer": 2,
+            "items": [{"id": "1", "src": "./assets/m1.png", "layer": 2}],
+        },
+    }
+    fake_bmo_js = "var src = DEFAULT_ASSTET_PATH + item.src; window.Bmoji = { configure: function(){}, renderAll: function(){} };"
+
+    mocked = MockHttpRouter()
+    mocked.get("https://bangumi.tv/group/topic/475911", status=200, body=sample_bmo_html)
+    mocked.get(
+        "https://lain.bgm.tv/img/smiles/blake/blake_14.gif",
+        status=200,
+        body=large_dynamic_gif,
+        headers={"Content-Type": "image/gif"},
+    )
+    mocked.get(
+        "https://bangumi.tv/img/smiles/tv/44.gif",
+        status=200,
+        body=PNG_1X1,
+        headers={"Content-Type": "image/gif"},
+    )
+    mocked.get(
+        "https://bangumi.tv/js/lib/bmo/bmo.js",
+        status=200,
+        body=fake_bmo_js,
+        headers={"Content-Type": "application/javascript"},
+    )
+    mocked.get(
+        "https://bangumi.tv/js/lib/bmo/assets/manifest.local.json",
+        status=200,
+        payload=fake_manifest,
+    )
+    mocked.get(
+        "https://bangumi.tv/js/lib/bmo/assets/f1.png",
+        status=200,
+        body=PNG_1X1,
+        headers={"Content-Type": "image/png"},
+    )
+    mocked.get(
+        "https://bangumi.tv/js/lib/bmo/assets/m1.png",
+        status=200,
+        body=PNG_1X1,
+        headers={"Content-Type": "image/png"},
+    )
+
+    async with aiohttp.ClientSession(middlewares=[mocked.middleware]) as sess:
+        parser = BangumiParser(sess)
+        link = parse_forum_url("https://bangumi.tv/group/topic/475911")
+        assert link is not None
+        res = await parser.parse_thread(link, embed_images=True, prefetch_data_uri=True)
+
+    # list 格式的 data_likes_list 成功提取
+    assert res.score == 3
+    assert len(res.reactions) == 1
+    assert res.reactions[0].emoji_url.startswith("data:image/png;base64,")
+    # >256KB 动态大表情成功保留为 Data URI + forum-smiley-dynamic，未降级为文字
+    assert "forum-smiley-dynamic" in res.content_html
+    assert "data:image/gif;base64," in res.content_html
+    assert "[(blake_14)]" not in res.content_html
+    # Bmoji span 与内联离线打包脚本均注入成功
+    assert 'class="bmo" data-code="(bmoCAIBzgEqALA)"' in res.content_html
+    assert "window.__BMOJI_ASSETS__" in res.bmo_script_html
+    payload, _ = build_template_payload(res, {"theme": "auto"})
+    assert payload["bmo_script_html"] == res.bmo_script_html
 
 
 @pytest.mark.asyncio

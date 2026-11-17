@@ -202,6 +202,9 @@ def convert_html_to_telegraph_nodes(
                 }
             ]
 
+        if tag == "span" and "bmo" in classes:
+            return ["[bmo表情]"]
+
         if tag in {"strong", "b"}:
             return [{"tag": "strong", "children": child_inlines}]
         if tag in {"em", "i"} or "forum-edit-note" in classes:
@@ -754,10 +757,16 @@ class TelegraphPublisher:
         same_site_hosts: set[str] | None,
         upload_url: str,
         max_images: int,
+        max_single_bytes: int = MAX_FORWARD_SINGLE_IMAGE_BYTES,
+        max_total_bytes: int = MAX_FORWARD_TOTAL_FILE_BYTES,
     ) -> tuple[dict[str, str], dict[int, str]]:
         """流式下载帖子配图并转存至 p.sda1.dev，每传完一张立即删除本地临时文件以保障低内存与零磁盘堆积。"""
         if not thread.post_image_urls or max_images <= 0:
             return {}, {}
+
+        safety_ceiling = 200 * 1024 * 1024
+        eff_single_cap = safety_ceiling if max_single_bytes <= 0 else max_single_bytes
+        eff_total_cap = safety_ceiling if max_total_bytes <= 0 else max_total_bytes
 
         target_urls = thread.post_image_urls[:max_images]
         idx_to_inlined_uri: dict[int, str] = {}
@@ -787,10 +796,10 @@ class TelegraphPublisher:
                         url_map[rewrite_legacy_media_url(orig_url)] = exempt_https
                         return
 
-                remain = MAX_FORWARD_TOTAL_FILE_BYTES - used_bytes
+                remain = eff_total_cap - used_bytes
                 if remain <= 0:
                     return
-                eff_cap = min(MAX_FORWARD_SINGLE_IMAGE_BYTES, remain)
+                eff_cap = min(eff_single_cap, remain)
                 local_file: Path | None = None
                 written = 0
                 clean_u = rewrite_legacy_media_url(orig_url)
@@ -849,7 +858,7 @@ class TelegraphPublisher:
                         await asyncio.to_thread(local_file.unlink, True)
 
         for batch_start in range(0, len(target_urls), 2):
-            if used_bytes >= MAX_FORWARD_TOTAL_FILE_BYTES:
+            if used_bytes >= eff_total_cap:
                 break
             batch = [
                 (i, target_urls[i])
@@ -928,6 +937,8 @@ class TelegraphPublisher:
         upload_images: bool = True,
         upload_url: str = DEFAULT_SDA1_UPLOAD_URL,
         max_upload_images: int = 25,
+        max_single_image_bytes: int = MAX_FORWARD_SINGLE_IMAGE_BYTES,
+        max_total_images_bytes: int = MAX_FORWARD_TOTAL_FILE_BYTES,
     ) -> str:
         """将解析后的帖子（及上传至 p.sda1.dev 的配图）发布到 telegra.ph 并返回文章链接。"""
         url_map: dict[str, str] = {}
@@ -940,6 +951,8 @@ class TelegraphPublisher:
                 same_site_hosts=same_site_hosts,
                 upload_url=upload_url,
                 max_images=max_upload_images,
+                max_single_bytes=max_single_image_bytes,
+                max_total_bytes=max_total_images_bytes,
             )
 
         all_nodes = build_full_telegraph_document(

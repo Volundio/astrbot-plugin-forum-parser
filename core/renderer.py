@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import inspect
 import os
 import struct
@@ -10,8 +11,14 @@ from pathlib import Path
 from typing import Any
 
 import aiohttp
+from astrbot.api import logger
 
-from .io_guard import MAX_RENDERED_IMAGE_BYTES, read_response_bounded, stream_response_to_file
+from .io_guard import (
+    MAX_RENDERED_IMAGE_BYTES,
+    ResponseTooLargeError,
+    read_response_bounded,
+    stream_response_to_file,
+)
 from .models import ForumType, ParsedThread, RenderResult
 from .temp_manager import TempFileManager, TempScope
 
@@ -233,6 +240,7 @@ def build_template_payload(
             }
             for rs in thread.related_subjects
         ],
+        "bmo_script_html": thread.bmo_script_html,
     }
 
     screenshot_options: dict[str, Any] = {
@@ -296,6 +304,7 @@ class ForumCardRenderer:
         *,
         tmpl_str: str | None = None,
         temp_scope: TempScope | None = None,
+        max_bytes: int = MAX_RENDERED_IMAGE_BYTES,
     ) -> str:
         """直接调用 astrbot-t2i-service 的 POST /text2img/generate 接口并按块流式保存为本地临时图片。
 
@@ -326,26 +335,32 @@ class ForumCardRenderer:
                     raise RuntimeError(
                         f"远程 T2I 服务 ({gen_url}) 返回 HTTP {resp.status}: {err_body}"
                     )
-                await stream_response_to_file(resp, out_path, max_bytes=MAX_RENDERED_IMAGE_BYTES)
+                await stream_response_to_file(resp, out_path, max_bytes=max_bytes)
                 return str(out_path)
         finally:
             if owns_session:
                 await sess.close()
 
-    async def render_thread_card(
-        self,
-        thread: ParsedThread,
-        *,
-        plugin_t2i_endpoint: str = "",
-        render_options: dict[str, Any] | None = None,
-        umo: str | None = None,
-        temp_scope: TempScope | None = None,
-    ) -> RenderResult:
-        """将 ParsedThread 渲染为本地图片文件并返回 RenderResult。"""
-        tmpl_data, options = build_template_payload(thread, render_options)
-        selected_tmpl = self._bgm_tmpl_str if thread.forum == ForumType.BANGUMI else self._tmpl_str
-        effective_endpoint = self._resolve_effective_endpoint(plugin_t2i_endpoint, umo=umo)
+    async def _discard_single_rendered_file(
+        self, img_path: str | None, temp_scope: TempScope | None
+    ) -> None:
+        if not img_path:
+            return
+        if self.temp_manager is not None:
+            await self.temp_manager.remove_file(img_path)
+        elif temp_scope is None:
+            await asyncio.to_thread(Path(img_path).unlink, True)
 
+    async def _invoke_render_once(
+        self,
+        tmpl_str: str,
+        tmpl_data: dict[str, Any],
+        options: dict[str, Any],
+        *,
+        effective_endpoint: str | None,
+        temp_scope: TempScope | None,
+        max_bytes: int,
+    ) -> str:
         img_path: str | None = None
         html_renderer = getattr(self.context, "html_renderer", None) if self.context else None
 
@@ -356,7 +371,7 @@ class ForumCardRenderer:
 
             if supports_endpoint_kw:
                 img_path = await render_fn(
-                    selected_tmpl,
+                    tmpl_str,
                     tmpl_data,
                     return_url=False,
                     options=options,
@@ -365,7 +380,7 @@ class ForumCardRenderer:
             elif not effective_endpoint:
                 # 未单独覆盖 endpoint 时，直接走旧版 AstrBot 内置 html_renderer
                 img_path = await render_fn(
-                    selected_tmpl,
+                    tmpl_str,
                     tmpl_data,
                     return_url=False,
                     options=options,
@@ -377,8 +392,9 @@ class ForumCardRenderer:
                 effective_endpoint or DEFAULT_ASTRBOT_T2I_ENDPOINT,
                 tmpl_data,
                 options,
-                tmpl_str=selected_tmpl,
+                tmpl_str=tmpl_str,
                 temp_scope=temp_scope,
+                max_bytes=max_bytes,
             )
 
         if temp_scope is not None:
@@ -386,21 +402,99 @@ class ForumCardRenderer:
         elif self.temp_manager is not None:
             self.temp_manager.register(img_path)
 
-        try:
-            width, height, mime_type, file_size = await asyncio.to_thread(
-                _inspect_file_meta, img_path
-            )
-        except BaseException:
-            if temp_scope is not None:
-                await temp_scope.cleanup()
-            elif self.temp_manager is not None:
-                await self.temp_manager.remove_file(img_path)
-            raise
+        return img_path
 
-        return RenderResult(
-            image_path=img_path,
-            width=width,
-            height=height,
-            file_size=file_size,
-            mime_type=mime_type,
+    async def render_thread_card(
+        self,
+        thread: ParsedThread,
+        *,
+        plugin_t2i_endpoint: str = "",
+        render_options: dict[str, Any] | None = None,
+        umo: str | None = None,
+        temp_scope: TempScope | None = None,
+        platform_hint: str = "",
+    ) -> RenderResult:
+        """将 ParsedThread 渲染为本地图片文件并返回 RenderResult（超限或 413 时自动降级重绘）。"""
+        base_opts = dict(render_options or {})
+        max_rendered_mb = int(base_opts.get("max_rendered_card_mb") or 15)
+        max_rendered_bytes = (
+            max_rendered_mb * 1024 * 1024 if max_rendered_mb > 0 else MAX_RENDERED_IMAGE_BYTES
         )
+        stream_limit = max(MAX_RENDERED_IMAGE_BYTES, max_rendered_bytes)
+        selected_tmpl = self._bgm_tmpl_str if thread.forum == ForumType.BANGUMI else self._tmpl_str
+        effective_endpoint = self._resolve_effective_endpoint(plugin_t2i_endpoint, umo=umo)
+
+        cur_thread = thread
+        cur_opts = dict(base_opts)
+        last_exc: BaseException | None = None
+
+        for attempt in range(3):
+            tmpl_data, options = build_template_payload(cur_thread, cur_opts)
+            img_path: str | None = None
+            try:
+                eff_stream_cap = (
+                    min(stream_limit, max_rendered_bytes)
+                    if (attempt < 2 and max_rendered_bytes > 0)
+                    else stream_limit
+                )
+                img_path = await self._invoke_render_once(
+                    selected_tmpl,
+                    tmpl_data,
+                    options,
+                    effective_endpoint=effective_endpoint,
+                    temp_scope=temp_scope,
+                    max_bytes=eff_stream_cap,
+                )
+                width, height, mime_type, file_size = await asyncio.to_thread(
+                    _inspect_file_meta, img_path
+                )
+            except BaseException as exc:
+                await self._discard_single_rendered_file(img_path, temp_scope)
+                err_low = str(exc).lower()
+                is_limit_err = isinstance(exc, ResponseTooLargeError) or any(
+                    k in err_low
+                    for k in ("413", "dimension limit", "pixel limit", "超过落盘安全上限")
+                )
+                if not is_limit_err or attempt == 2:
+                    raise
+                last_exc = exc
+                hit_dim = any(k in err_low for k in ("413", "dimension", "pixel"))
+                logger.warning(
+                    f"渲染卡片超出尺寸或体积上限，正在降级重试 (第 {attempt + 1} 次): {exc}"
+                )
+                cur_opts = dict(cur_opts)
+                cur_opts["image_format"] = "jpeg"
+                cur_opts["device_scale_factor"] = "normal"
+                cur_opts["jpeg_quality"] = 80 if attempt == 0 else 68
+                if hit_dim or attempt == 1:
+                    cur_opts["enable_length_limit"] = True
+                    cur_opts["max_card_height_px"] = 9200 if attempt == 0 else 6500
+                    cur_thread = dataclasses.replace(cur_thread, is_truncated=True)
+                continue
+
+            oversize = max_rendered_bytes > 0 and file_size > max_rendered_bytes
+            too_tall_for_onebot = platform_hint == "aiocqhttp" and height > 22000
+            if not (oversize or too_tall_for_onebot) or attempt == 2:
+                return RenderResult(
+                    image_path=img_path,
+                    width=width,
+                    height=height,
+                    file_size=file_size,
+                    mime_type=mime_type,
+                )
+
+            await self._discard_single_rendered_file(img_path, temp_scope)
+            logger.warning(
+                f"渲染长图尺寸/体积超限 ({width}x{height}, {file_size} bytes)，正在自动降级重绘 (第 {attempt + 1} 次)"
+            )
+            cur_opts = dict(cur_opts)
+            cur_opts["image_format"] = "jpeg"
+            cur_opts["device_scale_factor"] = "normal"
+            cur_opts["jpeg_quality"] = 78 if attempt == 0 else 65
+            if too_tall_for_onebot or attempt == 1:
+                cur_opts["enable_length_limit"] = True
+                cur_opts["max_card_height_px"] = 9200 if attempt == 0 else 6500
+                cur_thread = dataclasses.replace(cur_thread, is_truncated=True)
+
+        assert last_exc is not None
+        raise last_exc

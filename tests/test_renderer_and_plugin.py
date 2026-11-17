@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import struct
+from contextlib import aclosing
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ from core.renderer import (
     load_forum_card_template,
     normalize_t2i_endpoint,
 )
+from core.temp_manager import TempFileManager
 
 
 def _make_png_bytes(width: int, height: int) -> bytes:
@@ -628,7 +630,117 @@ async def test_s1_single_pass_temp_scope_attachment_oversize_rehost_and_non_cach
     async with aclosing(plugin.on_forum_link_message(ev2)) as agen:
         _ = [r async for r in agen]
 
-    cache_key = ("stage1st", "2299999", True, True, 15, False, 15000)
+    cache_key = (
+        "stage1st",
+        "2299999",
+        True,
+        True,
+        15,
+        6 * 1024 * 1024,
+        12 * 1024 * 1024,
+        False,
+        15000,
+    )
     assert plugin._parse_cache.get(cache_key) is None
+
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_multipage_long_post_split_and_oversize_card_downgrade(tmp_path: Path) -> None:
+    """验证：
+    1. 超长多图日志在 QQ OneBot 合并转发模式下自动拆分为多页卡片节点（防止突破 20MB 触发 Highway error_code=921）；
+    2. 单张渲染长图超过配置的 max_rendered_card_mb 时，自动降级画质/缩放重绘至体积达标；
+    3. 自定义图片大小限制设置项（render_options / onebot_options）生效。
+    """
+    import main as plugin_pkg
+    from core.html_sanitizer import split_html_into_card_pages
+
+    long_paragraphs = "".join(
+        f"<p>第 {i} 段漫谈汽车在影视作品中的叙事作用。"
+        + ("经典镜头分析与文化意象阐述。" * 25)
+        + "</p>"
+        for i in range(1, 22)
+    )
+    pages = split_html_into_card_pages(
+        long_paragraphs, max_chars_per_page=3200, max_imgs_per_page=4
+    )
+    assert len(pages) >= 3
+
+    long_blog_html = f"""
+    <!DOCTYPE html><html><body>
+      <div id="viewEntry">
+        <h1 class="title">超长长评测试</h1>
+        <div class="user-card">
+          <div class="title"><a href="/user/572941">卡林のZ</a></div>
+        </div>
+        <div class="time">2024-4-13 10:15 · 43 分钟阅读</div>
+      </div>
+      <div id="entry_content">{long_paragraphs}</div>
+      <div id="comment_list"></div>
+    </body></html>
+    """
+    mocked = MockHttpRouter()
+    mocked.get("https://bangumi.tv/blog/337198", status=200, body=long_blog_html)
+
+    seen_scales: list[str] = []
+
+    class OversizeThenNormalRenderer:
+        async def render_custom_template(
+            self,
+            tmpl_str: str,
+            tmpl_data: dict[str, Any],
+            return_url: bool = False,
+            options: dict[str, Any] | None = None,
+            **_: Any,
+        ) -> str:
+            opts = options or {}
+            scale = str(opts.get("device_scale_factor_level") or "high")
+            seen_scales.append(scale)
+            p = tmp_path / f"page_{len(seen_scales)}.jpg"
+            if len(seen_scales) == 1:
+                # 模拟首张生成 > 3MB 触发自定义 max_rendered_card_mb=2 降级重绘
+                p.write_bytes(_make_png_bytes(780, 1200) + b"\x00" * (2_500_000))
+            else:
+                p.write_bytes(_make_png_bytes(780, 1200))
+            return str(p)
+
+    ctx = Context(html_renderer=OversizeThenNormalRenderer())
+    plugin = plugin_pkg.ForumParserPlugin(
+        ctx,
+        config={
+            "parse_options": {"cooldown_seconds": 0},
+            "render_options": {
+                "max_inline_single_mb": 8,
+                "max_inline_total_mb": 20,
+                "max_rendered_card_mb": 2,
+                "device_scale_factor": "high",
+            },
+            "onebot_options": {
+                "use_forward": True,
+                "forward_max_single_image_mb": 12,
+                "forward_max_total_images_mb": 80,
+            },
+        },
+    )
+    plugin._temp_mgr = TempFileManager(tmp_path / "mp_temp")
+    plugin._http_session = aiohttp.ClientSession(middlewares=[mocked.middleware])
+    plugin._ensure_services()
+
+    # 验证 TempFileManager 磁盘配额随用户 onebot_options.forward_max_total_images_mb=80 自动扩容
+    assert plugin._temp_mgr.max_dir_bytes >= (2 * 80 + 64) * 1024 * 1024
+
+    ev = AstrMessageEvent("https://bangumi.tv/blog/337198", platform_name="aiocqhttp")
+    async with aclosing(plugin.on_forum_link_message(ev)) as agen:
+        out = [r async for r in agen]
+
+    assert len(out) == 1
+    assert out[0].kind == "chain"
+    nodes = out[0].payload[0].nodes
+    # 第 1 页先以 high 触发超 2MB，自动降级 normal 成功；且总节点数 = 摘要 + 多页长图节点
+    assert seen_scales[0] == "high" and seen_scales[1] == "normal"
+    card_nodes = [n for n in nodes if "日志长评" in n.name]
+    assert len(card_nodes) >= 2
+    assert "(1/" in card_nodes[0].name
 
     await plugin.terminate()

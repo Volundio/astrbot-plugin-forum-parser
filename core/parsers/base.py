@@ -74,6 +74,10 @@ class BaseForumParser(ABC):
         max_content_chars: int = 15000,
         temp_scope: TempScope | None = None,
         rehost_oversize_fn: Callable[[Path, str], Awaitable[str | None]] | None = None,
+        max_inline_single_bytes: int | None = None,
+        max_inline_total_bytes: int | None = None,
+        max_download_single_bytes: int | None = None,
+        max_download_total_bytes: int | None = None,
     ) -> ParsedThread:
         """解析帖子主楼并返回统一的 ParsedThread 结构。"""
         raise NotImplementedError

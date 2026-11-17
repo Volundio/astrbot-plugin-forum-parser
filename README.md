@@ -24,7 +24,7 @@
   - 默认完整渲染整栋主楼长图，同时提供可选的超长主楼字数与高度截断开关。
 - **防内存溢出（OOM）与临时文件即时清理机制**
   - **流式分块落盘代替常驻内存**：渲染长图与 OneBot11 合并转发的帖子原图均通过 64KB 流式分块直写请求级临时目录（`TempScope`），不将多张大图同时堆叠在 Python 内存中；内存解析缓存严格限制为仅缓存 `<=128KB` 的纯文本轻量结果（总上限 `1MB`），渲染完成后立即释放重型 HTML 字符串引用。
-  - **多层体积上限与并发背压保护**：所有 HTTP 响应均带 `Content-Length` 预检与分块读取硬上限（网页/JSON 5MB、渲染卡片内嵌图片单图上限 5MB / 整帖合计上限 10MB、OneBot11 合并转发单图上限 10MB / 整包本地图片总预算 50MB——超出预算或源站失效的配图自动安全跳过并附上纯文本提示，防止下游 `Node.to_dict()` 异常中断发送）；内置全局并发信号量 `max_concurrent_tasks`（默认 `2`）防止群聊刷屏引发并发内存峰值叠加。
+  - **多层体积上限与并发背压保护**：所有 HTTP 响应均带 `Content-Length` 预检与分块读取硬上限（网页/JSON 5MB；卡片内嵌默认单图 6MB / 整帖 12MB，单张渲染图默认上限 15MB，OneBot11 合并转发与 Telegraph 上传默认单图 10MB / 总预算 50MB——均可在插件设置中自由调整）；超长长评自动多卡分页、超出单图上限自动降级重绘以防 QQ Highway 上传失败（`error_code=921`）；内置全局并发信号量 `max_concurrent_tasks`（默认 `2`）防止群聊刷屏引发并发内存峰值叠加。
   - **发送即刻销毁（双重钩子保障）**：渲染长图、合并转发落盘配图及 AstrBot 内置 `html_renderer` 生成在 `data/temp/io_temp_img_*` 的文件均绑定至 `TempScope`，在消息发送完成瞬间通过 `@filter.after_message_sent` 钩子与生成器 `finally` 块整目录销毁，空目录自动移除。
   - **启动自检、定时配额巡检与停用清空**：插件启动时自动清扫崩溃遗留文件与 `.tmp` 半成品；运行期每 60 秒执行 TTL 超时与磁盘总字节配额（160MB）淘汰；插件停用/重载（`terminate`）时全量清空。
 
@@ -46,10 +46,10 @@ git clone https://github.com/Volundio/astrbot-plugin-forum-parser.git astrbot_pl
 | 配置分组 | 关键配置项 | 说明 |
 | --- | --- | --- |
 | 顶层配置 | `t2i_endpoint` | 文本转图像服务 API 地址（如 `http://127.0.0.1:8999`）。留空则使用 AstrBot 全局远程渲染服务。 |
-| `render_options` | `theme` / `viewport_width` / `device_scale_factor` / `embed_images` / `enable_length_limit` | 控制卡片配色主题、宽度、清晰度倍率、主楼图片内嵌数量上限以及超长帖截断保护。 |
+| `render_options` | `theme` / `viewport_width` / `device_scale_factor` / `max_inline_single_mb` / `max_inline_total_mb` / `max_rendered_card_mb` | 控制卡片配色主题、宽度、清晰度倍率、卡片内嵌单图/总大小上限、单张渲染长图体积上限与超长截断开关。 |
 | `parse_options` | `allow_alias_domains` / `parse_share_cards` / `cooldown_seconds` | 控制同源别名域名开关、QQ JSON 卡片/TG 超链接提取以及同帖重复触发冷却时间。 |
-| `telegram_options` | `delivery_mode` / `fallback_to_image` / `image_upload_url` / `max_upload_images` | 控制 Telegram 推送方式（默认 `telegraph` 即时预览或 `image_file` 渲染长图）、失败长图兜底开关以及 `p.sda1.dev` 配图转存设置。 |
-| `onebot_options` | `use_forward` / `forward_include_images` / `forward_max_images` | 控制 QQ (OneBot11) 默认合并转发开关、是否在合并转发中一并附带帖子原图及原图数量上限。 |
+| `telegram_options` | `delivery_mode` / `fallback_to_image` / `max_upload_images` / `upload_max_single_image_mb` / `upload_max_total_images_mb` | 控制 Telegram 推送方式（默认 `telegraph` 即时预览或 `image_file` 渲染长图）、失败长图兜底开关以及图床转存单图/总大小上限。 |
+| `onebot_options` | `use_forward` / `forward_include_images` / `forward_max_images` / `forward_max_single_image_mb` / `forward_max_total_images_mb` | 控制 QQ (OneBot11) 默认合并转发开关、是否在合并转发中一并附带帖子原图及原图数量与单图/总大小上限（超长帖自动拆分为多页卡片节点）。 |
 | `stage1st` | `username` / `password` / `question_id` / `answer` / `enable_invisible_parse` | 配置 S1 账号密码（可选安全提问、Cookie 或 `app_sid` 兜底），开启后自动解锁审核中与禁言屏蔽内容。 |
 | `nga` | `passport_uid` / `passport_cid` / `cookie` | 配置浏览器登录 NGA 后的 `ngaPassportUid` 与 `ngaPassportCid`（或完整 Cookie 字符串）。 |
 | `bangumi` | `enabled` / `cookie` | 控制 Bangumi 解析开关及可选网页 Cookie（仅在 QQ OneBot 平台生效，Telegram 平台不解析）。 |
